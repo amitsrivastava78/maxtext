@@ -1,0 +1,50 @@
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# MaxText/configs/debug_kascade.yml
+# Tiny Llama config for CPU development and Kascade attention testing
+
+# We inherit from the base configuration
+base_config: "base.yml"
+
+# --- Model Architecture (Tiny Version) ---
+# A standard Llama has 32 layers. We use 2.
+# A standard Llama has 4096 dim. We use 64.
+per_device_batch_size: 1
+max_target_length: 64       # Short sequence length for fast debugging
+base_num_decoder_layers: 2  # Layer 0 (Anchor) + Layer 1 (Reuse) = Perfect test
+base_num_query_heads: 2
+base_num_kv_heads: 2
+head_dim: 32
+base_emb_dim: 64
+base_mlp_dim: 128
+vocab_size: 256             # Tiny vocab
+
+# --- Execution Settings ---
+# We use "iota_embed" which generates fake embeddings mathematically.
+# This means we don't even need to download a tokenizer file!
+use_iota_embed: True
+steps: 3                    # Run for 3 steps then stop
+enable_checkpointing: False # Don't save heavy files
+decoder_block: "llama2"     # Use the Llama architecture logic
+dataset_type: "synthetic"   # Use synthetic data for testing
+attention: "dot_product"    # Use simple dot product attention for CPU
+
+# Optimizer settings
+learning_rate: 1.e-4
+opt_type: "adam_pax"
+
+# Misc settings
+logits_via_embedding: False
+normalization_layer_epsilon: 1.e-5
