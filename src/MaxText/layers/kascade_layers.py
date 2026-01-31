@@ -14,6 +14,60 @@ import numpy as np
 # Format: { "layer_0_indices": array([Batch, Heads, TopK_Tiles]) }
 KASCADE_CACHE = {}
 
+# RoPE Helper Functions for LLaMA-3.1
+def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
+    """
+    Precompute the frequency tensor for RoPE (Rotary Position Embedding).
+    LLaMA-3.1 uses theta=500000 instead of standard 10000.
+    
+    Args:
+        dim: Head dimension (should be 128 for LLaMA-3.1)
+        end: Maximum sequence length
+        theta: Base for frequency computation (500000 for LLaMA-3.1)
+    
+    Returns:
+        Complex tensor of shape [end, dim//2] for RoPE rotation
+    """
+    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
+    t = jnp.arange(end, dtype=jnp.float32)
+    freqs = jnp.outer(t, freqs)
+    freqs_cis = jnp.exp(1j * freqs)  # Complex exponential
+    return freqs_cis
+
+def apply_rope(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray):
+    """
+    Apply Rotary Position Embedding to query and key tensors.
+    
+    Args:
+        xq: Query tensor [batch, heads, seq, dim]
+        xk: Key tensor [batch, heads, seq, dim]
+        freqs_cis: Precomputed frequency tensor [seq, dim//2]
+    
+    Returns:
+        Rotated query and key tensors
+    """
+    # Reshape last dimension to pairs for complex rotation
+    xq_ = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+    xk_ = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+    
+    # Convert to complex numbers
+    xq_complex = jax.lax.complex(xq_[..., 0], xq_[..., 1])
+    xk_complex = jax.lax.complex(xk_[..., 0], xk_[..., 1])
+    
+    # Broadcast freqs_cis to match batch and heads dimensions
+    # freqs_cis: [seq, dim//2] -> [1, 1, seq, dim//2]
+    freqs_cis = freqs_cis[None, None, :xq.shape[2], :]
+    
+    # Apply rotation
+    xq_rotated = xq_complex * freqs_cis
+    xk_rotated = xk_complex * freqs_cis
+    
+    # Convert back to real representation
+    xq_out = jnp.stack([xq_rotated.real, xq_rotated.imag], axis=-1).reshape(xq.shape)
+    xk_out = jnp.stack([xk_rotated.real, xk_rotated.imag], axis=-1).reshape(xk.shape)
+    
+    return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
+
 class KascadeAnchorAttention(nn.Module):
     """
     The 'Scout' Layer.
@@ -28,7 +82,7 @@ class KascadeAnchorAttention(nn.Module):
     tile_size: int = 16    # Size of each memory block (Hardware friendly)
 
     @nn.compact
-    def __call__(self, x, mask=None):
+    def __call__(self, x, mask=None, freq_cis=None):
         batch, seq_len, _ = x.shape
         
         # 1. Standard Dense Attention
@@ -39,6 +93,16 @@ class KascadeAnchorAttention(nn.Module):
         q = q.reshape(batch, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch, seq_len, self.num_heads, self.head_dim)
         v = v.reshape(batch, seq_len, self.num_heads, self.head_dim)
+        
+        # Apply RoPE if provided (for LLaMA-3.1 compatibility)
+        if freq_cis is not None:
+            # Transpose to [Batch, Heads, Seq, Dim] for RoPE
+            q_t = jnp.transpose(q, (0, 2, 1, 3))
+            k_t = jnp.transpose(k, (0, 2, 1, 3))
+            q_t, k_t = apply_rope(q_t, k_t, freq_cis)
+            # Transpose back to [Batch, Seq, Heads, Dim]
+            q = jnp.transpose(q_t, (0, 2, 1, 3))
+            k = jnp.transpose(k_t, (0, 2, 1, 3))
         
         # Calculate Scores: (Q @ K) / sqrt(d)
         logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(self.head_dim)
@@ -99,7 +163,7 @@ class KascadeReuseAttention(nn.Module):
     head_map: dict = None
 
     @nn.compact
-    def __call__(self, x, mask=None):
+    def __call__(self, x, mask=None, freq_cis=None):
         batch, seq_len, _ = x.shape
         
         # 1. Projections
@@ -115,6 +179,10 @@ class KascadeReuseAttention(nn.Module):
         q = jnp.transpose(q, (0, 2, 1, 3)) # [B, H, S, D]
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
+        
+        # Apply RoPE if provided (for LLaMA-3.1 compatibility)
+        if freq_cis is not None:
+            q, k = apply_rope(q, k, freq_cis)
 
         # 2. Retrieve Anchor Indices
         cache_key = f"layer_{self.anchor_layer_id}_indices"

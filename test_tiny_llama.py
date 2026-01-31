@@ -22,6 +22,7 @@ spec.loader.exec_module(kascade_module)
 KascadeAnchorAttention = kascade_module.KascadeAnchorAttention
 KascadeReuseAttention = kascade_module.KascadeReuseAttention
 KASCADE_CACHE = kascade_module.KASCADE_CACHE
+precompute_freqs_cis = kascade_module.precompute_freqs_cis
 
 # --- HEAD MAPPING SOLVER ---
 
@@ -257,10 +258,17 @@ class TinyLlamaBlock(nn.Module):
     emb_dim: int
     layer_id: int
     schedule: dict
+    use_rope: bool = False  # Enable for LLaMA-3.1 compatibility
 
     @nn.compact
     def __call__(self, x):
         normed = nn.RMSNorm(epsilon=1e-5)(x)
+        
+        # Precompute RoPE frequencies if enabled
+        freq_cis = None
+        if self.use_rope:
+            seq_len = x.shape[1]
+            freq_cis = precompute_freqs_cis(self.head_dim, seq_len, theta=500000.0)
         
         # Check Schedule (It is now a Dict, not just a string)
         # Default to Anchor if missing
@@ -268,6 +276,7 @@ class TinyLlamaBlock(nn.Module):
         
         if plan["type"] == "ANCHOR":
             attn = KascadeAnchorAttention(self.num_heads, self.head_dim, self.layer_id)
+            attn_out = attn(normed, freq_cis=freq_cis)
         else:
             # Extract config from the plan
             anchor_id = plan["anchor_id"]
@@ -279,8 +288,9 @@ class TinyLlamaBlock(nn.Module):
                 anchor_id,
                 head_map=head_map # <--- Pass it down
             )
+            attn_out = attn(normed, freq_cis=freq_cis)
             
-        x = x + attn(normed)
+        x = x + attn_out
         x = x + nn.Dense(self.emb_dim)(nn.RMSNorm(epsilon=1e-5)(x)) # Simple MLP
         return x
 
@@ -288,6 +298,7 @@ class TinyLlama(nn.Module):
     vocab_size: int
     num_layers: int
     schedule: dict
+    use_rope: bool = False  # Enable for LLaMA-3.1 compatibility
 
     @nn.compact
     def __call__(self, input_ids):
@@ -295,7 +306,7 @@ class TinyLlama(nn.Module):
         for i in range(self.num_layers):
             x = TinyLlamaBlock(
                 num_heads=NUM_HEADS, head_dim=32, mlp_dim=EMBED_DIM*2, emb_dim=EMBED_DIM,
-                layer_id=i, schedule=self.schedule
+                layer_id=i, schedule=self.schedule, use_rope=self.use_rope
             )(x)
         return nn.RMSNorm(epsilon=1e-5)(x)
 
