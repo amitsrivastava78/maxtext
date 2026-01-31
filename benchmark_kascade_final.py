@@ -8,6 +8,7 @@ Layer 0 DENSE + TOP_K 12 + Real Wikipedia Text
 import sys
 import os
 import pickle
+import argparse
 from pathlib import Path
 
 # Add src to path
@@ -31,7 +32,7 @@ KascadeReuseAttention = kascade_module.KascadeReuseAttention
 KASCADE_CACHE = kascade_module.KASCADE_CACHE
 precompute_freqs_cis = kascade_module.precompute_freqs_cis
 
-# Configuration
+# Model Configuration (Fixed)
 WEIGHTS_DIR = "llama_weights_chunked"
 NUM_LAYERS = 16
 NUM_HEADS = 32
@@ -40,10 +41,17 @@ EMBED_DIM = 2048
 MLP_DIM = 8192
 VOCAB_SIZE = 128256
 SEQ_LEN = 512
-TILE_SIZE = 16
 
-# CRITICAL OVERRIDES for 1B model optimization
-TOP_K_OPTIMIZED = 12  # Increased from 8 to 12 for better 1B capacity
+# Hyperparameters (Defaults - can be overridden via command line)
+DEFAULT_TILE_SIZE = 16
+DEFAULT_TOP_K = 12  # Optimized for 1B model (paper uses 8 for 8B)
+DEFAULT_THRESHOLD = 0.65  # 65% Jaccard similarity for reuse
+DEFAULT_MAX_REUSE_DIST = 4  # Maximum layers between anchor and reuse
+DEFAULT_DEVICE = 'cpu'  # Default to CPU for compatibility
+
+# Global variables (set by parse_args)
+TILE_SIZE = DEFAULT_TILE_SIZE
+TOP_K_OPTIMIZED = DEFAULT_TOP_K
 
 def solve_head_mapping_corrected(reuse_tiles, anchor_tiles, num_heads):
     """Correct head mapping with proper dimensions."""
@@ -114,7 +122,7 @@ def generate_optimized_schedule(layer_analysis, num_layers, threshold=0.65, max_
     
     return schedule
 
-def calibrate_on_real_text_optimized(params, calib_ids):
+def calibrate_on_real_text_optimized(params, calib_ids, threshold, max_reuse_dist):
     """Calibrate with ALL ANCHOR schedule (including Layer 0)."""
     print("\n📊 Calibrating on Real Wikipedia Text...")
     print(f"   Calibration data: {calib_ids.shape}")
@@ -139,7 +147,7 @@ def calibrate_on_real_text_optimized(params, calib_ids):
             score, head_map = solve_head_mapping_corrected(curr_tiles, prev_tiles, NUM_HEADS)
             layer_analysis[i] = (score, head_map)
     
-    return generate_optimized_schedule(layer_analysis, NUM_LAYERS, threshold=0.65, max_reuse_dist=4)
+    return generate_optimized_schedule(layer_analysis, NUM_LAYERS, threshold=threshold, max_reuse_dist=max_reuse_dist)
 
 # --- WEIGHT LOADING ---
 def load_embeddings(weights_dir=WEIGHTS_DIR):
@@ -275,11 +283,85 @@ class LlamaModel(nn.Module):
         
         return logits
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Kascade Sparse Attention Benchmark for LLaMA 3.2-1B",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Hyperparameters
+    parser.add_argument(
+        "--tile_size",
+        type=int,
+        default=DEFAULT_TILE_SIZE,
+        help="Size of attention tiles (tokens per tile)"
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help="Number of top tiles to select in Anchor layers (paper uses 8 for 8B, 12 for 1B)"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help="Jaccard similarity threshold for reusing anchor tiles (0.0-1.0)"
+    )
+    parser.add_argument(
+        "--max_reuse_dist",
+        type=int,
+        default=DEFAULT_MAX_REUSE_DIST,
+        help="Maximum layer distance between anchor and reuse layers"
+    )
+    
+    # Paths
+    parser.add_argument(
+        "--weights_dir",
+        type=str,
+        default=WEIGHTS_DIR,
+        help="Directory containing converted LLaMA weights"
+    )
+    
+    # Device selection
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=DEFAULT_DEVICE,
+        choices=['cpu', 'tpu', 'gpu'],
+        help="Device to run on (cpu, tpu, or gpu)"
+    )
+    
+    return parser.parse_args()
+
 def main():
-    print("=" * 70)
+    # Parse arguments
+    args = parse_args()
+    
+    # Configure JAX device
+    print(f"🖥️  Configuring JAX to use {args.device.upper()}...")
+    jax.config.update('jax_platform_name', args.device)
+    
+    # Verify device configuration
+    devices = jax.devices()
+    print(f"✓ JAX using {len(devices)} {devices[0].platform.upper()} device(s): {[d.id for d in devices]}")
+    
+    # Update global variables with command line values
+    global TILE_SIZE, TOP_K_OPTIMIZED
+    TILE_SIZE = args.tile_size
+    TOP_K_OPTIMIZED = args.top_k
+    
+    print("\n" + "=" * 70)
     print("🚀 FINAL KASCADE BENCHMARK")
-    print("   Layer 0 DENSE + TOP_K 12 + Real Wikipedia Text")
     print("=" * 70)
+    print(f"\n⚙️  Configuration:")
+    print(f"   Device:           {args.device.upper()}")
+    print(f"   Tile Size:        {args.tile_size}")
+    print(f"   Top-K Tiles:      {args.top_k}")
+    print(f"   Threshold:        {args.threshold:.2%}")
+    print(f"   Max Reuse Dist:   {args.max_reuse_dist}")
+    print(f"   Weights Dir:      {args.weights_dir}")
     
     # Load weights
     print("\n📥 Loading Weights...")
@@ -304,7 +386,7 @@ def main():
     print(f"   Test: {test_ids.shape[1]} tokens (UNSEEN)")
     
     # Calibrate
-    schedule = calibrate_on_real_text_optimized(params_dict, calib_ids)
+    schedule = calibrate_on_real_text_optimized(params_dict, calib_ids, args.threshold, args.max_reuse_dist)
     
     reuse_count = sum(1 for v in schedule.values() if v["type"] == "REUSE")
     print(f"\n📋 Final Schedule: {reuse_count} REUSE, {NUM_LAYERS - reuse_count} ANCHOR/DENSE")
@@ -344,6 +426,55 @@ def main():
         print(f"\n✅ Good! <5% degradation (paper target met)")
     else:
         print(f"\n⚠️ Gap is {diff_pct:.2f}%. Consider increasing TOP_K to 16.")
+    
+    # Speedup benchmark
+    print("\n" + "=" * 70)
+    print("⏱️  SPEEDUP BENCHMARK")
+    print("=" * 70)
+    
+    import time
+    n_runs = 5
+    
+    print(f"\nBenchmarking {n_runs} runs each...")
+    
+    # Warmup
+    print("  Warming up...")
+    _ = model_dense.apply(params_dict, test_ids)
+    _ = model_sparse.apply(params_dict, test_ids)
+    
+    # Dense timing
+    print("  Timing Dense...")
+    dense_times = []
+    for i in range(n_runs):
+        KASCADE_CACHE.clear()
+        start = time.time()
+        _ = model_dense.apply(params_dict, test_ids)
+        dense_times.append(time.time() - start)
+    
+    # Sparse timing
+    print("  Timing Sparse...")
+    sparse_times = []
+    for i in range(n_runs):
+        KASCADE_CACHE.clear()
+        start = time.time()
+        _ = model_sparse.apply(params_dict, test_ids)
+        sparse_times.append(time.time() - start)
+    
+    dense_avg = sum(dense_times) / len(dense_times) * 1000
+    sparse_avg = sum(sparse_times) / len(sparse_times) * 1000
+    speedup = dense_avg / sparse_avg if sparse_avg > 0 else 0
+    
+    print(f"\n📊 Timing Results (avg of {n_runs} runs):")
+    print(f"   Dense:   {dense_avg:.2f} ms")
+    print(f"   Sparse:  {sparse_avg:.2f} ms")
+    print(f"   Speedup: {speedup:.2f}x")
+    
+    if speedup > 1.2:
+        print(f"\n✅ Sparse is {speedup:.2f}x faster!")
+    elif speedup > 0.8:
+        print(f"\n⚠️  Speedup: {speedup:.2f}x (CPU has overhead, expect better on TPU)")
+    else:
+        print(f"\n⚠️  Sparse slower ({speedup:.2f}x) - normal on CPU due to overhead")
     
     print("\n" + "=" * 70)
 
