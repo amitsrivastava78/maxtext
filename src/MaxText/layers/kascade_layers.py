@@ -36,7 +36,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
 
 def apply_rope(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray):
     """
-    Apply Rotary Position Embedding to query and key tensors.
+    Apply RoPE using Adjacent Pairs format (compatible with Meta weights).
+    Correctly pairs dimension (i, i+1) as adjacent pairs.
     
     Args:
         xq: Query tensor [batch, heads, seq, dim]
@@ -46,27 +47,33 @@ def apply_rope(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray):
     Returns:
         Rotated query and key tensors
     """
-    # Reshape last dimension to pairs for complex rotation
-    xq_ = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-    xk_ = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+    # xq, xk shape: [Batch, Heads, Seq, Dim]
+    # freqs_cis shape: [Seq, Dim//2] (Complex)
     
-    # Convert to complex numbers
-    xq_complex = jax.lax.complex(xq_[..., 0], xq_[..., 1])
-    xk_complex = jax.lax.complex(xk_[..., 0], xk_[..., 1])
+    # Cast to float32 for complex operations
+    xq = xq.astype(jnp.float32)
+    xk = xk.astype(jnp.float32)
     
-    # Broadcast freqs_cis to match batch and heads dimensions
-    # freqs_cis: [seq, dim//2] -> [1, 1, seq, dim//2]
+    # Reshape to pairs: [B, H, S, D] -> [B, H, S, D/2, 2]
+    xq_pairs = xq.reshape(*xq.shape[:-1], -1, 2)
+    xk_pairs = xk.reshape(*xk.shape[:-1], -1, 2)
+    
+    # Convert pairs to complex: (x0, x1) -> x0 + i*x1
+    xq_complex = jax.lax.complex(xq_pairs[..., 0], xq_pairs[..., 1])
+    xk_complex = jax.lax.complex(xk_pairs[..., 0], xk_pairs[..., 1])
+    
+    # Reshape frequencies for broadcasting [1, 1, Seq, Dim//2]
     freqs_cis = freqs_cis[None, None, :xq.shape[2], :]
     
-    # Apply rotation
+    # Apply rotation (complex multiplication)
     xq_rotated = xq_complex * freqs_cis
     xk_rotated = xk_complex * freqs_cis
     
-    # Convert back to real representation
+    # Reconstruct: interleave real and imaginary
     xq_out = jnp.stack([xq_rotated.real, xq_rotated.imag], axis=-1).reshape(xq.shape)
     xk_out = jnp.stack([xk_rotated.real, xk_rotated.imag], axis=-1).reshape(xk.shape)
     
-    return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
+    return xq_out.astype(jnp.float16), xk_out.astype(jnp.float16)
 
 class KascadeAnchorAttention(nn.Module):
     """
@@ -147,6 +154,13 @@ class KascadeAnchorAttention(nn.Module):
         output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
         output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        
+        # --- DEBUG: Check for NaN ---
+        def check_nan(x, layer_id):
+            if jnp.any(jnp.isnan(x)):
+                print(f"  ⚠️  NaN detected in Anchor Layer {layer_id} output!")
+        jax.debug.callback(check_nan, output, self.layer_id)
+        
         return output
 
 class KascadeReuseAttention(nn.Module):
@@ -220,6 +234,10 @@ class KascadeReuseAttention(nn.Module):
         token_indices = tile_starts + offsets
         flat_token_indices = token_indices.reshape(batch, self.num_heads, -1)
         
+        # --- CRITICAL FIX: Clip indices to valid range [0, seq_len-1] ---
+        # This prevents out-of-bounds gather that causes NaN
+        flat_token_indices = jnp.clip(flat_token_indices, 0, seq_len - 1)
+        
         # Debug print to show sparse computation size (only prints shape, not traced values)
         def print_sparse_info(shape_val):
             print(f"  [Reuse  L{self.anchor_layer_id+1}..] Using {shape_val} sparse tokens (vs {seq_len} full)")
@@ -250,10 +268,22 @@ class KascadeReuseAttention(nn.Module):
 
         # 7. Softmax & Output
         sparse_weights = jax.nn.softmax(sparse_logits, axis=-1)
+        
+        # --- CRITICAL FIX: Handle fully-masked rows (all -inf) that produce NaN in softmax ---
+        # When all keys are masked (future), softmax produces NaN. Replace with uniform distribution.
+        is_nan = jnp.isnan(sparse_weights)
+        sparse_weights = jnp.where(is_nan, 1.0 / sparse_weights.shape[-1], sparse_weights)
+        
         output = jnp.einsum('bhqk,bhkd->bhqd', sparse_weights, v_sparse)
         
         output = jnp.transpose(output, (0, 2, 1, 3))
         output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        
+        # --- DEBUG: Check for NaN ---
+        def check_nan(x, layer_id):
+            if jnp.any(jnp.isnan(x)):
+                print(f"  ⚠️  NaN detected in Reuse Layer {layer_id} output!")
+        jax.debug.callback(check_nan, output, self.anchor_layer_id)
         
         return output

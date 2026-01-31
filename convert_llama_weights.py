@@ -42,6 +42,40 @@ def expand_gqa_weights(weight, num_q_heads=32, num_kv_heads=8):
     return weight_expanded
 
 
+def permute_for_rope(weight, num_heads, head_dim):
+    """Permutes weights to convert from 'Half-Split' (HF) to 'Interleaved' (JAX) RoPE.
+    
+    HF RoPE pairs: (0, 64), (1, 65)... (pairs dimension i with i + dim/2)
+    JAX RoPE pairs: (0, 1), (2, 3)... (pairs dimension i with i + 1)
+    
+    We need to reorder the OUTPUT dimension of the weights so that 
+    HF's (0, 64) become JAX's (0, 1).
+    
+    Args:
+        weight: Weight tensor [Embed_Dim, Num_Heads * Head_Dim]
+        num_heads: Number of attention heads
+        head_dim: Dimension of each head
+    
+    Returns:
+        Permuted weight with interleaved RoPE pairing
+    """
+    embed_dim = weight.shape[0]
+    
+    # 1. Reshape to isolate heads: [Embed, Heads, Head_Dim]
+    w = weight.reshape(embed_dim, num_heads, head_dim)
+    
+    # 2. Split Head_Dim into two halves (HF style): [Embed, Heads, 2, Half_Dim]
+    w = w.reshape(embed_dim, num_heads, 2, head_dim // 2)
+    
+    # 3. Transpose to interleave (Swap axis 2 and 3)
+    # From [2, Half_Dim] (0..63, 64..127) -> [Half_Dim, 2] ((0,64), (1,65)...)
+    w = w.transpose(0, 1, 3, 2)
+    
+    # 4. Flatten back: [Embed, Heads * Head_Dim]
+    w = w.reshape(embed_dim, num_heads * head_dim)
+    return w
+
+
 def convert_layer_weights(layer_idx, state_dict, config):
     """
     Convert a single transformer layer from PyTorch to JAX format.
@@ -54,19 +88,39 @@ def convert_layer_weights(layer_idx, state_dict, config):
     Returns:
         Flax-compatible nested dict for this layer
     """
-    prefix = f"model.layers.{layer_idx}"
+    # Support both HuggingFace and Meta formats
+    if f"model.layers.{layer_idx}.self_attn.q_proj.weight" in state_dict:
+        # HuggingFace format
+        prefix = f"model.layers.{layer_idx}"
+        wq = state_dict[f"{prefix}.self_attn.q_proj.weight"].half().cpu().numpy()
+        wk = state_dict[f"{prefix}.self_attn.k_proj.weight"].half().cpu().numpy()
+        wv = state_dict[f"{prefix}.self_attn.v_proj.weight"].half().cpu().numpy()
+        wo = state_dict[f"{prefix}.self_attn.o_proj.weight"].half().cpu().numpy()
+        w_gate = state_dict[f"{prefix}.mlp.gate_proj.weight"].half().cpu().numpy()
+        w_up = state_dict[f"{prefix}.mlp.up_proj.weight"].half().cpu().numpy()
+        w_down = state_dict[f"{prefix}.mlp.down_proj.weight"].half().cpu().numpy()
+        ln_attn = state_dict[f"{prefix}.input_layernorm.weight"].half().cpu().numpy()
+        ln_mlp = state_dict[f"{prefix}.post_attention_layernorm.weight"].half().cpu().numpy()
+    else:
+        # Meta format
+        prefix = f"layers.{layer_idx}"
+        wq = state_dict[f"{prefix}.attention.wq.weight"].half().cpu().numpy()
+        wk = state_dict[f"{prefix}.attention.wk.weight"].half().cpu().numpy()
+        wv = state_dict[f"{prefix}.attention.wv.weight"].half().cpu().numpy()
+        wo = state_dict[f"{prefix}.attention.wo.weight"].half().cpu().numpy()
+        w_gate = state_dict[f"{prefix}.feed_forward.w3.weight"].half().cpu().numpy()  # Note: w3 is gate in Meta
+        w_up = state_dict[f"{prefix}.feed_forward.w1.weight"].half().cpu().numpy()
+        w_down = state_dict[f"{prefix}.feed_forward.w2.weight"].half().cpu().numpy()
+        ln_attn = state_dict[f"{prefix}.attention_norm.weight"].half().cpu().numpy()
+        ln_mlp = state_dict[f"{prefix}.ffn_norm.weight"].half().cpu().numpy()
     
-    # Attention weights
-    wq = state_dict[f"{prefix}.self_attn.q_proj.weight"].cpu().numpy()
-    wk = state_dict[f"{prefix}.self_attn.k_proj.weight"].cpu().numpy()
-    wv = state_dict[f"{prefix}.self_attn.v_proj.weight"].cpu().numpy()
-    wo = state_dict[f"{prefix}.self_attn.o_proj.weight"].cpu().numpy()
+    # Attention weights (now loaded above based on format)
     
     # Config
-    embed_dim = config['hidden_size']  # 4096
+    embed_dim = config['hidden_size']  # 4096 or 2048
     num_q_heads = config['num_attention_heads']  # 32
     num_kv_heads = config['num_key_value_heads']  # 8
-    head_dim = embed_dim // num_q_heads  # 128
+    head_dim = embed_dim // num_q_heads  # 128 or 64
     
     # Reshape K/V for GQA expansion
     wk_reshaped = wk.reshape(num_kv_heads * head_dim, embed_dim)
@@ -85,18 +139,18 @@ def convert_layer_weights(layer_idx, state_dict, config):
     
     # Transpose for JAX Dense layers (PyTorch: [Out, In] → JAX: [In, Out])
     wq = wq.T
-    wk = wk_expanded.T
-    wv = wv_expanded.T
+    wk = wk_expanded  # Already correct shape from expand_gqa_weights
+    wv = wv_expanded  # Already correct shape from expand_gqa_weights
     wo = wo.T
     
-    # MLP weights
-    w_gate = state_dict[f"{prefix}.mlp.gate_proj.weight"].cpu().numpy().T
-    w_up = state_dict[f"{prefix}.mlp.up_proj.weight"].cpu().numpy().T
-    w_down = state_dict[f"{prefix}.mlp.down_proj.weight"].cpu().numpy().T
+    # NOTE: RoPE permutation NOT applied - Meta weights already compatible with JAX
     
-    # LayerNorm weights
-    ln_attn = state_dict[f"{prefix}.input_layernorm.weight"].cpu().numpy()
-    ln_mlp = state_dict[f"{prefix}.post_attention_layernorm.weight"].cpu().numpy()
+    # MLP weights (already loaded above based on format)
+    w_gate = w_gate.T
+    w_up = w_up.T
+    w_down = w_down.T
+    
+    # LayerNorm weights (already loaded above based on format)
     
     # Build Flax nested dict
     return {
@@ -142,7 +196,37 @@ def convert_llama_weights(input_path, output_path, chunked=True):
     
     # Load config
     config_file = input_path / "config.json"
-    if not config_file.exists():
+    params_file = input_path / "params.json"
+    
+    if config_file.exists():
+        # HuggingFace format
+        import json
+        with open(config_file) as f:
+            hf_config = json.load(f)
+        config = {
+            'hidden_size': hf_config.get('hidden_size', 4096),
+            'num_attention_heads': hf_config.get('num_attention_heads', 32),
+            'num_key_value_heads': hf_config.get('num_key_value_heads', 8),
+            'num_hidden_layers': hf_config.get('num_hidden_layers', 32),
+            'intermediate_size': hf_config.get('intermediate_size', 14336),
+            'vocab_size': hf_config.get('vocab_size', 128256),
+            'rope_theta': hf_config.get('rope_theta', 500000.0),
+        }
+    elif params_file.exists():
+        # Meta format
+        import json
+        with open(params_file) as f:
+            meta_params = json.load(f)
+        config = {
+            'hidden_size': meta_params['dim'],
+            'num_attention_heads': meta_params['n_heads'],
+            'num_key_value_heads': meta_params['n_kv_heads'],
+            'num_hidden_layers': meta_params['n_layers'],
+            'intermediate_size': int(meta_params['dim'] * 4 * meta_params.get('ffn_dim_multiplier', 1.0)),
+            'vocab_size': meta_params['vocab_size'],
+            'rope_theta': meta_params.get('rope_theta', 500000.0),
+        }
+    else:
         # Default LLaMA-3.1-8B config
         config = {
             'hidden_size': 4096,
@@ -153,11 +237,7 @@ def convert_llama_weights(input_path, output_path, chunked=True):
             'vocab_size': 128256,
             'rope_theta': 500000.0,
         }
-        print("Warning: config.json not found, using default LLaMA-3.1-8B config")
-    else:
-        import json
-        with open(config_file) as f:
-            config = json.load(f)
+        print("Warning: No config file found, using default LLaMA-3.1-8B config")
     
     print(f"Model config: {config['num_hidden_layers']} layers, "
           f"{config['num_attention_heads']} Q heads, "
@@ -165,9 +245,18 @@ def convert_llama_weights(input_path, output_path, chunked=True):
     
     # Convert embeddings
     print("\nConverting embeddings...")
-    embed_tokens = state_dict['model.embed_tokens.weight'].cpu().numpy()
-    final_ln = state_dict['model.norm.weight'].cpu().numpy()
-    lm_head = state_dict.get('lm_head.weight', embed_tokens).cpu().numpy().T
+    
+    # Support both HuggingFace and Meta formats
+    if 'model.embed_tokens.weight' in state_dict:
+        # HuggingFace format
+        embed_tokens = state_dict['model.embed_tokens.weight'].half().cpu().numpy()
+        final_ln = state_dict['model.norm.weight'].half().cpu().numpy()
+        lm_head = state_dict.get('lm_head.weight', embed_tokens).half().cpu().numpy().T
+    else:
+        # Meta format
+        embed_tokens = state_dict['tok_embeddings.weight'].half().cpu().numpy()
+        final_ln = state_dict['norm.weight'].half().cpu().numpy()
+        lm_head = state_dict.get('output.weight', embed_tokens).half().cpu().numpy().T
     
     # Convert layers
     print("\nConverting transformer layers...")
