@@ -367,23 +367,74 @@ def main():
     print("\n📥 Loading Weights...")
     params_dict, config = load_all_weights()
     
-    # Prepare real text
-    print("\n📝 Preparing Real Wikipedia Text...")
-    text_tokens = [
-        # Full Wikipedia paragraph
-        128000, 9470, 16895, 11478, 374, 11478, 21091, 555, 12933,
-        11, 439, 16475, 311, 5933, 11478, 12882, 555, 12966, 13,
-        15836, 3495, 706, 1027, 4613, 439, 279, 2115, 315, 4007,
-        315, 25530, 13307, 13, 578, 4751, 574, 78718, 304, 220, 6280, 21, 13,
-    ] * 30  # Repeat for length
+    # Prepare real text from C4 dataset
+    print("\n📝 Loading Real C4 Dataset...")
+    from datasets import load_dataset
+    from transformers import AutoTokenizer, GPT2Tokenizer
+    import os
     
-    all_ids = jnp.array([text_tokens[:1024]], dtype=jnp.int32)
-    split = 512
-    calib_ids = all_ids[:, :split]
-    test_ids = all_ids[:, split:]
+    # Try to use HuggingFace authentication
+    hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
     
-    print(f"   Calibration: {calib_ids.shape[1]} tokens")
-    print(f"   Test: {test_ids.shape[1]} tokens (UNSEEN)")
+    # Load tokenizer (try LLaMA first, fallback to GPT2)
+    print("   Loading tokenizer...")
+    tokenizer = None
+    try:
+        if hf_token:
+            from huggingface_hub import login
+            login(token=hf_token, add_to_git_credential=False)
+            print("   ✓ Authenticated with HuggingFace")
+        
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+        print("   ✓ Using LLaMA-3.2-1B tokenizer")
+    except Exception as e:
+        print(f"   ⚠️  Could not load LLaMA tokenizer: {e}")
+        print("   Trying GPT2 tokenizer as fallback...")
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+        print("   ✓ Using GPT2 tokenizer (close approximation)")
+    
+    # Load C4 validation split
+    print("   Loading C4 validation data...")
+    dataset = load_dataset(
+        "allenai/c4", 
+        "en", 
+        split="validation", 
+        streaming=True,
+        trust_remote_code=True
+    )
+    
+    # Collect tokens from multiple different documents
+    print("   Tokenizing documents...")
+    all_tokens = []
+    doc_count = 0
+    for example in dataset:
+        if len(all_tokens) >= 1024:
+            break
+        
+        # Tokenize and take tokens
+        text = example['text'][:2000]  # Limit text length
+        tokens = tokenizer.encode(text, add_special_tokens=False)  # No special tokens to avoid mismatch
+        all_tokens.extend(tokens)
+        doc_count += 1
+        
+        if doc_count >= 5:  # Limit to 5 documents to speed up
+            break
+    
+    print(f"   ✓ Collected tokens from {doc_count} documents")
+    
+    # Trim to exactly 1024 tokens
+    all_tokens = all_tokens[:1024]
+    
+    # Ensure we have valid token IDs (clip to vocab size)
+    all_tokens = [min(t, VOCAB_SIZE - 1) for t in all_tokens]
+    
+    # Split into calibration (first 512) and test (next 512)
+    calib_ids = jnp.array([all_tokens[:512]], dtype=jnp.int32)
+    test_ids = jnp.array([all_tokens[512:1024]], dtype=jnp.int32)
+    
+    print(f"   ✓ Calibration: {calib_ids.shape[1]} tokens from C4")
+    print(f"   ✓ Test: {test_ids.shape[1]} tokens (different documents)")
     
     # Calibrate
     schedule = calibrate_on_real_text_optimized(params_dict, calib_ids, args.threshold, args.max_reuse_dist)

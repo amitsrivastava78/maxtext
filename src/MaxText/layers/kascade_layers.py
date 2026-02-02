@@ -10,6 +10,9 @@ import jax.numpy as jnp
 from flax import linen as nn
 import numpy as np
 
+# Debug Mode Flag - Set to False for production benchmarks
+DEBUG_MODE = False
+
 # Global Cache to pass data between layers during Calibration & Inference
 # Format: { "layer_0_indices": array([Batch, Heads, TopK_Tiles]) }
 KASCADE_CACHE = {}
@@ -146,9 +149,10 @@ class KascadeAnchorAttention(nn.Module):
         KASCADE_CACHE[cache_key] = top_tile_indices
         
         # Debug Visualization
-        def print_anchor(idx):
-            print(f"  [Anchor L{self.layer_id}] Selected Top-{self.top_k_tiles} Tiles (Head 0): {idx[0,0]}")
-        jax.debug.callback(print_anchor, top_tile_indices)
+        if DEBUG_MODE:
+            def print_anchor(idx):
+                print(f"  [Anchor L{self.layer_id}] Selected Top-{self.top_k_tiles} Tiles (Head 0): {idx[0,0]}")
+            jax.debug.callback(print_anchor, top_tile_indices)
         
         # Finish Layer
         output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
@@ -156,10 +160,11 @@ class KascadeAnchorAttention(nn.Module):
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
         
         # --- DEBUG: Check for NaN ---
-        def check_nan(x, layer_id):
-            if jnp.any(jnp.isnan(x)):
-                print(f"  ⚠️  NaN detected in Anchor Layer {layer_id} output!")
-        jax.debug.callback(check_nan, output, self.layer_id)
+        if DEBUG_MODE:
+            def check_nan(x, layer_id):
+                if jnp.any(jnp.isnan(x)):
+                    print(f"  ⚠️  NaN detected in Anchor Layer {layer_id} output!")
+            jax.debug.callback(check_nan, output, self.layer_id)
         
         return output
 
@@ -209,9 +214,10 @@ class KascadeReuseAttention(nn.Module):
             my_tile_indices = anchor_indices[:, perm_indices, :]
             
             # Debug Proof (Show the Shuffle)
-            def print_map(p):
-                print(f"  [Reuse  L{self.anchor_layer_id+1}..] Applied Map: H0 uses Anchor H{p[0]}, H1 uses Anchor H{p[1]}...")
-            jax.debug.callback(print_map, perm_indices)
+            if DEBUG_MODE:
+                def print_map(p):
+                    print(f"  [Reuse  L{self.anchor_layer_id+1}..] Applied Map: H0 uses Anchor H{p[0]}, H1 uses Anchor H{p[1]}...")
+                jax.debug.callback(print_map, perm_indices)
         else:
             my_tile_indices = anchor_indices
 
@@ -239,9 +245,10 @@ class KascadeReuseAttention(nn.Module):
         flat_token_indices = jnp.clip(flat_token_indices, 0, seq_len - 1)
         
         # Debug print to show sparse computation size (only prints shape, not traced values)
-        def print_sparse_info(shape_val):
-            print(f"  [Reuse  L{self.anchor_layer_id+1}..] Using {shape_val} sparse tokens (vs {seq_len} full)")
-        jax.debug.callback(print_sparse_info, flat_token_indices.shape[2])
+        if DEBUG_MODE:
+            def print_sparse_info(shape_val):
+                print(f"  [Reuse  L{self.anchor_layer_id+1}..] Using {shape_val} sparse tokens (vs {seq_len} full)")
+            jax.debug.callback(print_sparse_info, flat_token_indices.shape[2])
         
         # 5. Perform Gather
         k_sparse = jnp.take_along_axis(k, flat_token_indices[..., None], axis=2)
@@ -281,9 +288,10 @@ class KascadeReuseAttention(nn.Module):
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
         
         # --- DEBUG: Check for NaN ---
-        def check_nan(x, layer_id):
-            if jnp.any(jnp.isnan(x)):
-                print(f"  ⚠️  NaN detected in Reuse Layer {layer_id} output!")
-        jax.debug.callback(check_nan, output, self.anchor_layer_id)
+        if DEBUG_MODE:
+            def check_nan(x, layer_id):
+                if jnp.any(jnp.isnan(x)):
+                    print(f"  ⚠️  NaN detected in Reuse Layer {layer_id} output!")
+            jax.debug.callback(check_nan, output, self.anchor_layer_id)
         
         return output
