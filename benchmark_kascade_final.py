@@ -80,9 +80,51 @@ def solve_head_mapping_corrected(reuse_tiles, anchor_tiles, num_heads):
     avg_score = total_score / num_heads
     return avg_score, mapping
 
-def generate_optimized_schedule(layer_analysis, num_layers, threshold=0.65, max_reuse_dist=4):
-    """Generate schedule with Layer 0 DENSE fix."""
+def generate_schedule_structure(consecutive_similarities, num_layers, threshold=0.65, max_reuse_dist=4):
+    """Generate schedule structure determining ANCHOR vs REUSE (without head mappings yet)."""
     print(f"\n⚡ Generating Optimized Schedule:")
+    print(f"   Similarity threshold: {threshold:.2%} (tuned for 1B)")
+    print(f"   Max reuse distance: {max_reuse_dist}")
+    
+    # CRITICAL: Layer 0 MUST be DENSE (paper Section 3.1)
+    schedule = {0: {"type": "DENSE"}}
+    print("  Layer 0: DENSE (full attention - paper requirement)")
+    
+    # Layer 1 is first ANCHOR
+    schedule[1] = {"type": "ANCHOR"}
+    print("  Layer 1: ANCHOR (first sparse layer)")
+    last_anchor = 1
+    
+    for i in range(2, num_layers):
+        if i not in consecutive_similarities:
+            schedule[i] = {"type": "ANCHOR"}
+            last_anchor = i
+            print(f"  Layer {i}: ANCHOR (no data)")
+            continue
+        
+        score = consecutive_similarities[i]
+        distance = i - last_anchor
+        
+        if score >= threshold and distance < max_reuse_dist:
+            print(f"  Layer {i}: REUSE L{last_anchor} (consecutive similarity: {score:.2%})")
+            schedule[i] = {
+                "type": "REUSE",
+                "anchor_id": last_anchor,
+                "head_map": {}  # Will be filled in second pass
+            }
+        else:
+            schedule[i] = {"type": "ANCHOR"}
+            last_anchor = i
+            if score < threshold:
+                print(f"  Layer {i}: ANCHOR (low similarity: {score:.2%})")
+            else:
+                print(f"  Layer {i}: ANCHOR (distance: {distance})")
+    
+    return schedule
+
+def generate_optimized_schedule(layer_analysis, num_layers, threshold=0.65, max_reuse_dist=4):
+    """DEPRECATED: Old function for backward compatibility. Use generate_schedule_structure instead."""
+    print(f"\n⚡ Generating Optimized Schedule (OLD METHOD):")
     print(f"   Similarity threshold: {threshold:.2%} (tuned for 1B)")
     print(f"   Max reuse distance: {max_reuse_dist}")
     
@@ -123,7 +165,7 @@ def generate_optimized_schedule(layer_analysis, num_layers, threshold=0.65, max_
     return schedule
 
 def calibrate_on_real_text_optimized(params, calib_ids, threshold, max_reuse_dist):
-    """Calibrate with ALL ANCHOR schedule (including Layer 0)."""
+    """Calibrate with proper anchor-to-reuse head mappings."""
     print("\n📊 Calibrating on Real Wikipedia Text...")
     print(f"   Calibration data: {calib_ids.shape}")
     
@@ -134,20 +176,34 @@ def calibrate_on_real_text_optimized(params, calib_ids, threshold, max_reuse_dis
     KASCADE_CACHE.clear()
     _ = model.apply(params, calib_ids)
     
-    # Analyze layer similarities
-    layer_analysis = {}
-    for i in range(2, NUM_LAYERS):  # Start from 2 (L1 is always ANCHOR)
-        curr_key = f"layer_{i}_indices"
-        prev_key = f"layer_{i-1}_indices"
-        
-        curr_tiles = KASCADE_CACHE.get(curr_key)
-        prev_tiles = KASCADE_CACHE.get(prev_key)
-        
-        if curr_tiles is not None and prev_tiles is not None:
-            score, head_map = solve_head_mapping_corrected(curr_tiles, prev_tiles, NUM_HEADS)
-            layer_analysis[i] = (score, head_map)
+    # Store all tile indices for later comparison
+    all_tiles = {}
+    for i in range(NUM_LAYERS):
+        tiles = KASCADE_CACHE.get(f"layer_{i}_indices")
+        if tiles is not None:
+            all_tiles[i] = tiles
     
-    return generate_optimized_schedule(layer_analysis, NUM_LAYERS, threshold=threshold, max_reuse_dist=max_reuse_dist)
+    # First pass: compute consecutive layer similarities to determine schedule structure
+    consecutive_similarities = {}
+    for i in range(2, NUM_LAYERS):
+        if i in all_tiles and i-1 in all_tiles:
+            score, _ = solve_head_mapping_corrected(all_tiles[i], all_tiles[i-1], NUM_HEADS)
+            consecutive_similarities[i] = score
+    
+    # Generate schedule structure (which layers are ANCHOR vs REUSE and from which anchor)
+    schedule = generate_schedule_structure(consecutive_similarities, NUM_LAYERS, threshold, max_reuse_dist)
+    
+    # Second pass: compute correct head mappings between each REUSE layer and its designated ANCHOR
+    print("\n🔗 Computing Head Mappings...")
+    for layer_id, plan in schedule.items():
+        if plan["type"] == "REUSE":
+            anchor_id = plan["anchor_id"]
+            if layer_id in all_tiles and anchor_id in all_tiles:
+                score, head_map = solve_head_mapping_corrected(all_tiles[layer_id], all_tiles[anchor_id], NUM_HEADS)
+                plan["head_map"] = head_map
+                print(f"   Layer {layer_id} → Anchor {anchor_id}: {score:.2%} similarity")
+    
+    return schedule
 
 # --- WEIGHT LOADING ---
 def load_embeddings(weights_dir=WEIGHTS_DIR):
@@ -370,29 +426,44 @@ def main():
     # Prepare real text from C4 dataset
     print("\n📝 Loading Real C4 Dataset...")
     from datasets import load_dataset
-    from transformers import AutoTokenizer, GPT2Tokenizer
+    from transformers import AutoTokenizer
     import os
     
-    # Try to use HuggingFace authentication
+    # Check for HuggingFace authentication token
     hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
     
-    # Load tokenizer (try LLaMA first, fallback to GPT2)
-    print("   Loading tokenizer...")
-    tokenizer = None
+    if not hf_token:
+        print("\n❌ ERROR: HuggingFace authentication token not found!")
+        print("\n📋 Setup Instructions:")
+        print("   1. Get token from: https://huggingface.co/settings/tokens")
+        print("   2. Request access to: https://huggingface.co/meta-llama/Llama-3.2-1B")
+        print("   3. Set environment variable:")
+        print("      export HF_TOKEN='your_token_here'")
+        print("\n   Then re-run this script.")
+        sys.exit(1)
+    
+    # Authenticate with HuggingFace
+    print("   Authenticating with HuggingFace...")
+    from huggingface_hub import login
     try:
-        if hf_token:
-            from huggingface_hub import login
-            login(token=hf_token, add_to_git_credential=False)
-            print("   ✓ Authenticated with HuggingFace")
-        
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-        print("   ✓ Using LLaMA-3.2-1B tokenizer")
+        login(token=hf_token, add_to_git_credential=False)
+        print("   ✓ Authenticated")
     except Exception as e:
-        print(f"   ⚠️  Could not load LLaMA tokenizer: {e}")
-        print("   Trying GPT2 tokenizer as fallback...")
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-        print("   ✓ Using GPT2 tokenizer (close approximation)")
+        print(f"\n❌ ERROR: Authentication failed: {e}")
+        print("   Please check your HF_TOKEN is valid.")
+        sys.exit(1)
+    
+    # Load LLaMA tokenizer (required - no fallback)
+    print("   Loading LLaMA-3.2-1B tokenizer...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+        print("   ✓ Loaded tokenizer")
+    except Exception as e:
+        print(f"\n❌ ERROR: Could not load LLaMA tokenizer: {e}")
+        print("\n   Make sure you have access to the model:")
+        print("   https://huggingface.co/meta-llama/Llama-3.2-1B")
+        print("   Click 'Request Access' and wait for approval.")
+        sys.exit(1)
     
     # Load C4 validation split
     print("   Loading C4 validation data...")
