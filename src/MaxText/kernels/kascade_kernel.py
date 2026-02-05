@@ -54,16 +54,16 @@ class KascadeBlockSizes(NamedTuple):
 
 
 def kascade_attention_kernel(
-    # Inputs
+    # Inputs (passed first)
     q_ref,  # [block_q, head_dim]
     k_sparse_ref,  # [block_kv_sparse, head_dim]
     v_sparse_ref,  # [block_kv_sparse, head_dim]
-    # Scratch buffers (MUST match scratch_shapes order!)
+    # Output (passed BEFORE scratch buffers!)
+    o_ref,  # [block_q, head_dim] - final output
+    # Scratch buffers (passed AFTER output, in scratch_shapes order)
     m_scratch_ref,  # [block_q, NUM_LANES] - max logits (scratch_shapes[0])
     l_scratch_ref,  # [block_q, NUM_LANES] - sum of exp (scratch_shapes[1])
     o_scratch_ref,  # [block_q, head_dim] - output accumulator (scratch_shapes[2])
-    # Output
-    o_ref,  # [block_q, head_dim] - final output
     # Parameters
     *,
     mask_value: float,
