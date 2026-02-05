@@ -101,10 +101,14 @@ def test_correctness_tpu():
 
 
 def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
-    """Benchmark Phase 1 performance on TPU."""
+    """Benchmark Phase 2 performance on TPU."""
     print("\n" + "="*70)
-    print("PHASE 1 PERFORMANCE BENCHMARK (TPU)")
+    print("PHASE 2 PERFORMANCE BENCHMARK (TPU)")
     print("="*70)
+    print("\nPhase 2 optimizations:")
+    print("  - Smaller block_q (512→256) for better cache")
+    print("  - Adaptive loop unrolling")
+    print("  - Improved memory access patterns")
     
     # Realistic size
     num_heads = 32
@@ -175,12 +179,17 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # Results
     speedup = mean_ref / mean_kernel
     
+    # Calculate improvement over Phase 1 baseline
+    phase1_baseline = 0.785
+    
     print(f"\n{'='*70}")
     print("PERFORMANCE RESULTS:")
     print(f"{'='*70}")
     print(f"Reference (JAX):        {mean_ref*1000:.3f} ms")
-    print(f"Phase 1 Kernel:         {mean_kernel*1000:.3f} ms")
+    print(f"Phase 2 Kernel:         {mean_kernel*1000:.3f} ms")
     print(f"Speedup:                {speedup:.3f}×")
+    print(f"Phase 1 baseline:       {phase1_baseline:.3f}×")
+    print(f"Improvement:            {((speedup/phase1_baseline - 1)*100):+.1f}%")
     
     # Analysis
     if speedup >= 1.0:

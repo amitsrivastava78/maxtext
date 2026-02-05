@@ -43,10 +43,12 @@ class KascadeBlockSizes(NamedTuple):
         block_q: Query block size (must be multiple of NUM_LANES=128)
         block_kv_sparse: Sparse K/V block size (must be multiple of NUM_LANES=128)
         block_kv_compute: K/V compute block size (must divide block_kv_sparse)
+    
+    Phase 2 optimizations: Smaller blocks for better TPU cache utilization
     """
-    block_q: int = 512
+    block_q: int = 256  # Phase 2: Reduced from 512 for better cache hits
     block_kv_sparse: int = 256  # Sparse K/V length is much smaller
-    block_kv_compute: int | None = None
+    block_kv_compute: int | None = 128  # Phase 2: Explicit default for consistency
     
     def __post_init__(self):
         if self.block_kv_compute is None:
@@ -146,7 +148,9 @@ def kascade_attention_kernel(
     num_iters = bkv_sparse // bkv_compute
     m_init = jnp.full((bq, 1), mask_value, dtype=float32)
     l_init = jnp.zeros((bq, 1), dtype=float32)
-    m_final, l_final = lax.fori_loop(0, num_iters, body, (m_init, l_init), unroll=True)
+    # Phase 2: Explicit unroll for small iteration counts (2-4 iters typical)
+    should_unroll = num_iters <= 4
+    m_final, l_final = lax.fori_loop(0, num_iters, body, (m_init, l_init), unroll=should_unroll)
     
     # Write final statistics to scratch (for consistency, though not strictly needed)
     m_scratch_ref[...] = jnp.broadcast_to(m_final, (bq, NUM_LANES))
