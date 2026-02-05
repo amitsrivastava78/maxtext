@@ -135,12 +135,9 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # JIT compile both
     ref_fn = jax.jit(reference_attention_sparse)
     
-    # Phase 2 block sizes (optimized)
-    block_sizes = KascadeBlockSizes(
-        block_q=256,  # Phase 2: reduced from 512 for better cache utilization
-        block_kv_sparse=256,
-        block_kv_compute=128
-    )
+    # Use kernel defaults (Phase 2: block_q=256, block_kv_sparse=256, block_kv_compute=128)
+    # Note: Passing explicit block_sizes vs using defaults may affect XLA optimization
+    block_sizes = None  # Let kernel use its optimized defaults
     
     @jax.jit
     def kernel_fn(q, k, v):
