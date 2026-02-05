@@ -493,6 +493,7 @@ def main():
                 kernel_module = importlib.util.module_from_spec(kernel_spec)
                 print("   ✓ Kernel spec created")
                 
+                sys.modules[kernel_spec.name] = kernel_module
                 kernel_spec.loader.exec_module(kernel_module)
                 print("   ✓ Kernel module loaded")
                 
@@ -507,6 +508,7 @@ def main():
                 kascade_splash_module = importlib.util.module_from_spec(spec)
                 print("   ✓ Splash spec created")
                 
+                sys.modules[spec.name] = kascade_splash_module
                 # Inject the kernel module before execution
                 kascade_splash_module._KERNEL_MODULE = kernel_module
                 kascade_splash_module.__file__ = splash_path

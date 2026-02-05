@@ -31,6 +31,7 @@ try:
     kernel_module = importlib.util.module_from_spec(kernel_spec)
     print("   ✓ Spec created")
     
+    sys.modules[kernel_spec.name] = kernel_module
     kernel_spec.loader.exec_module(kernel_module)
     print("   ✅ Kernel module loaded successfully!")
     
@@ -59,6 +60,7 @@ try:
     splash_module.__file__ = splash_path
     print("   ✓ Kernel injected")
     
+    sys.modules[splash_spec.name] = splash_module
     splash_spec.loader.exec_module(splash_module)
     print("   ✅ Splash module loaded successfully!")
     
