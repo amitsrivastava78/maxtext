@@ -251,12 +251,22 @@ def convert_llama_weights(input_path, output_path, chunked=True):
         # HuggingFace format
         embed_tokens = state_dict['model.embed_tokens.weight'].half().cpu().numpy()
         final_ln = state_dict['model.norm.weight'].half().cpu().numpy()
-        lm_head = state_dict.get('lm_head.weight', embed_tokens).half().cpu().numpy().T
+        
+        # Handle lm_head (might be missing, use embed_tokens as fallback)
+        if 'lm_head.weight' in state_dict:
+            lm_head = state_dict['lm_head.weight'].half().cpu().numpy().T
+        else:
+            lm_head = embed_tokens.T  # Already numpy, just transpose
     else:
         # Meta format
         embed_tokens = state_dict['tok_embeddings.weight'].half().cpu().numpy()
         final_ln = state_dict['norm.weight'].half().cpu().numpy()
-        lm_head = state_dict.get('output.weight', embed_tokens).half().cpu().numpy().T
+        
+        # Handle output weight (might be missing, use embed_tokens as fallback)
+        if 'output.weight' in state_dict:
+            lm_head = state_dict['output.weight'].half().cpu().numpy().T
+        else:
+            lm_head = embed_tokens.T  # Already numpy, just transpose
     
     # Convert layers
     print("\nConverting transformer layers...")
