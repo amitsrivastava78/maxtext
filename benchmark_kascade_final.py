@@ -291,67 +291,31 @@ class LlamaBlock(nn.Module):
         
         plan = self.schedule.get(self.layer_id, {"type": "ANCHOR"})
         
-        # Use SplashAttention kernel if enabled (TPU only)
-        if self.use_splash and USE_SPLASH_KERNEL:
-            # Import the module that was loaded in main()
-            import sys
-            kascade_splash_module = sys.modules.get('kascade_splash_attention')
-            if kascade_splash_module is None:
-                raise ImportError("kascade_splash_attention not loaded")
-            
-            kascade_splash_attention = kascade_splash_module.kascade_splash_attention
-            
-            # For splash kernel, we need Q, K, V explicitly
-            # Compute them using Dense layers (matching the attention module structure)
-            wq = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_0")
-            wk = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_1")
-            wv = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_2")
-            wo = nn.Dense(EMBED_DIM, use_bias=False, name="Dense_3")
-            
-            Q = wq(normed).reshape(normed.shape[0], seq_len, NUM_HEADS, HEAD_DIM)
-            K = wk(normed).reshape(normed.shape[0], seq_len, NUM_HEADS, HEAD_DIM)
-            V = wv(normed).reshape(normed.shape[0], seq_len, NUM_HEADS, HEAD_DIM)
-            
-            # Apply RoPE
-            # TODO: Apply freq_cis rotation to Q and K
-            
-            # Call optimized kernel
-            is_anchor = plan["type"] in ["DENSE", "ANCHOR"]
-            anchor_id = None if is_anchor else plan["anchor_id"]
-            top_k_ratio = 1.0 if plan["type"] == "DENSE" else (TOP_K_OPTIMIZED / (seq_len / TILE_SIZE))
-            
-            attn_out = kascade_splash_attention(
-                Q, K, V,
-                layer_id=self.layer_id,
-                is_anchor_layer=is_anchor,
-                anchor_layer_id=anchor_id,
+        # Compute attention based on plan type
+        # Standard Kascade implementation
+        if plan["type"] == "DENSE":
+            attn = KascadeAnchorAttention(
+                NUM_HEADS, HEAD_DIM, self.layer_id,
+                top_k_tiles=32,
                 tile_size=TILE_SIZE,
-                top_k_ratio=top_k_ratio
+                use_splash=self.use_splash and USE_SPLASH_KERNEL
             )
-            attn_out = attn_out.reshape(normed.shape[0], seq_len, -1)
-            attn_out = wo(attn_out)
-        else:
-            # Standard Kascade implementation
-            if plan["type"] == "DENSE":
-                attn = KascadeAnchorAttention(
-                    NUM_HEADS, HEAD_DIM, self.layer_id,
-                    top_k_tiles=32,
-                    tile_size=TILE_SIZE
-                )
-                attn_out = attn(normed, freq_cis=freq_cis)
-            elif plan["type"] == "ANCHOR":
-                attn = KascadeAnchorAttention(
-                    NUM_HEADS, HEAD_DIM, self.layer_id,
-                    top_k_tiles=TOP_K_OPTIMIZED,
-                    tile_size=TILE_SIZE
-                )
-                attn_out = attn(normed, freq_cis=freq_cis)
-            else:
-                attn = KascadeReuseAttention(
-                    NUM_HEADS, HEAD_DIM, plan["anchor_id"],
-                    tile_size=TILE_SIZE, head_map=plan["head_map"]
-                )
-                attn_out = attn(normed, freq_cis=freq_cis)
+            attn_out = attn(normed, freq_cis=freq_cis)
+        elif plan["type"] == "ANCHOR":
+            attn = KascadeAnchorAttention(
+                NUM_HEADS, HEAD_DIM, self.layer_id,
+                top_k_tiles=TOP_K_OPTIMIZED,
+                tile_size=TILE_SIZE,
+                use_splash=self.use_splash and USE_SPLASH_KERNEL
+            )
+            attn_out = attn(normed, freq_cis=freq_cis)
+        else:  # REUSE
+            attn = KascadeReuseAttention(
+                NUM_HEADS, HEAD_DIM, plan["anchor_id"],
+                tile_size=TILE_SIZE, head_map=plan["head_map"],
+                use_splash=self.use_splash and USE_SPLASH_KERNEL
+            )
+            attn_out = attn(normed, freq_cis=freq_cis)
         
         x = x + attn_out
         

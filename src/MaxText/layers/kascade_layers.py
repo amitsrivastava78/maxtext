@@ -90,12 +90,13 @@ class KascadeAnchorAttention(nn.Module):
     # --- Configurable Parameters (Defaults) ---
     top_k_tiles: int = 8   # How many tiles to keep (Sparsity Budget: 8/32 = 75% savings)
     tile_size: int = 16    # Size of each memory block (Hardware friendly)
+    use_splash: bool = False  # Use SplashAttention kernel if available
 
     @nn.compact
     def __call__(self, x, mask=None, freq_cis=None):
         batch, seq_len, _ = x.shape
         
-        # 1. Standard Dense Attention
+        # 1. Standard Dense Projections (Q, K, V)
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         k = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         v = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
@@ -114,6 +115,30 @@ class KascadeAnchorAttention(nn.Module):
             q = jnp.transpose(q_t, (0, 2, 1, 3))
             k = jnp.transpose(k_t, (0, 2, 1, 3))
         
+        # Use SplashAttention kernel if enabled
+        if self.use_splash:
+            # Import the splash module that was loaded
+            import sys
+            kascade_splash_module = sys.modules.get('kascade_splash_attention')
+            if kascade_splash_module:
+                kascade_splash_attention = kascade_splash_module.kascade_splash_attention
+                
+                # Call splash kernel
+                top_k_ratio = self.top_k_tiles / (seq_len / self.tile_size)
+                attn_out = kascade_splash_attention(
+                    q, k, v,
+                    layer_id=self.layer_id,
+                    is_anchor_layer=True,
+                    tile_size=self.tile_size,
+                    top_k_ratio=top_k_ratio
+                )
+                
+                # Reshape and project
+                attn_out = attn_out.reshape(batch, seq_len, self.num_heads * self.head_dim)
+                output = nn.Dense(x.shape[-1], use_bias=False)(attn_out)
+                return output
+        
+        # Standard JAX implementation (fallback or when splash disabled)
         # Calculate Scores: (Q @ K) / sqrt(d)
         logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(self.head_dim)
         if mask is None: mask = jnp.tril(jnp.ones((seq_len, seq_len)))
@@ -183,6 +208,7 @@ class KascadeReuseAttention(nn.Module):
     anchor_layer_id: int
     tile_size: int = 16
     head_map: dict = None
+    use_splash: bool = False  # Use SplashAttention kernel if available
 
     @nn.compact
     def __call__(self, x, mask=None, freq_cis=None):
