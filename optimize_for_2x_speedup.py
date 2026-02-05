@@ -335,13 +335,12 @@ def main():
     except RuntimeError as e:
         if "TPU is already in use" in str(e):
             print("\n❌ ERROR: TPU is locked by another process!")
-            print("\nSOLUTION in Colab:")
-            print("1. Go to Runtime → Restart runtime")
-            print("2. Then run this script again")
-            print("\nAlternatively, try:")
-            print("  import os")
-            print("  os.system('sudo lsof -t /dev/accel0 | xargs -r kill -9')")
-            print("  # Then restart runtime")
+            print("\nThis happens if another script already claimed the TPU.")
+            print("\n✅ SIMPLE FIX:")
+            print("   1. Runtime → Restart runtime (in Colab menu)")
+            print("   2. Re-run: %cd maxtext && !python optimize_for_2x_speedup.py")
+            print("\nMake sure you haven't run other scripts (like test_phase1_standalone.py)")
+            print("in this session before running this optimization suite.")
             sys.exit(1)
         else:
             raise

@@ -54,13 +54,28 @@ Expected runtime: **5-10 minutes**
 RuntimeError: The TPU is already in use by process with pid XXXX
 ```
 
+**Common Cause:**
+You just ran `test_phase1_standalone.py` in the same session. Each Python script that uses JAX claims exclusive TPU access.
+
 **Fix (Recommended):**
 1. Go to **Runtime → Restart runtime** in Colab menu
 2. Re-run from Cell 1 (clone might say "already exists" - that's fine)
-3. Skip Cell 2 if JAX is already installed
-4. Run Cell 4 again
+3. Run `optimize_for_2x_speedup.py` **first** (before other scripts)
 
-**Alternative Fix:**
+**Alternative - Run both scripts:**
+```python
+# Option 1: Run test first, then restart for optimization
+!python test_phase1_standalone.py
+# Then: Runtime → Restart runtime
+!python optimize_for_2x_speedup.py
+
+# Option 2: Run optimization first, then restart for test  
+!python optimize_for_2x_speedup.py
+# Then: Runtime → Restart runtime
+!python test_phase1_standalone.py
+```
+
+**Nuclear option (if restart doesn't work):**
 ```python
 # In a new cell:
 import os
