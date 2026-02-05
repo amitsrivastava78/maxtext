@@ -58,6 +58,11 @@ class KascadeMask(splash_attention_mask._ComputableMask):  # pylint: disable=pro
         """Return the shape of the mask (seq_len, seq_len)"""
         return (self.seq_len, self.seq_len)
     
+    def __hash__(self):
+        """Hash for mask caching in SplashAttention"""
+        # Hash based on tile_size and seq_len (tile_indices are runtime values)
+        return hash((type(self).__name__, self.tile_size, self.seq_len))
+    
     def __call__(self, q_idx, kv_idx):
         """
         Mask function called by SplashAttention kernel.
