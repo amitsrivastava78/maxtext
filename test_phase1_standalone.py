@@ -101,15 +101,15 @@ def test_correctness_tpu():
 
 
 def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
-    """Benchmark Phase 3 performance on TPU."""
+    """Benchmark final optimized kernel on TPU."""
     print("\n" + "="*70)
-    print("PHASE 3 PERFORMANCE BENCHMARK (TPU)")
+    print("FINAL OPTIMIZED KERNEL BENCHMARK (TPU)")
     print("="*70)
-    print("\nPhase 3 optimizations:")
-    print("  - Hoist Q load outside loop (cache in registers)")
-    print("  - Load K and V together (memory coalescing)")
-    print("  - Fuse exp operations (better instruction scheduling)")
-    print("  - Eliminate redundant type conversions")
+    print("\nOptimizations applied:")
+    print("  - Phase 1: Carry-based m/l updates (avoid scratch reads)")
+    print("  - Phase 2: Optimized block sizes (block_q=256)")
+    print("  - Phase 2: Adaptive loop unrolling")
+    print("\nNote: Phase 3 attempts regressed performance and were reverted")
     
     # Realistic size
     num_heads = 32
@@ -163,9 +163,13 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
             print(f"  Run {i+1}/{num_runs}: {elapsed*1000:.2f} ms")
     
     mean_ref = sum(times_ref) / len(times_ref)
+    median_ref = sorted(times_ref)[len(times_ref)//2]
+    min_ref = min(times_ref)
+    max_ref = max(times_ref)
+    std_ref = (sum((t - mean_ref)**2 for t in times_ref) / len(times_ref))**0.5
     
     # Benchmark Phase 1 kernel
-    print("\nBenchmarking Phase 1 optimized kernel...")
+    print("\nBenchmarking optimized kernel...")
     times_kernel = []
     for i in range(num_runs):
         start = time.perf_counter()
@@ -176,26 +180,43 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
             print(f"  Run {i+1}/{num_runs}: {elapsed*1000:.2f} ms")
     
     mean_kernel = sum(times_kernel) / len(times_kernel)
+    median_kernel = sorted(times_kernel)[len(times_kernel)//2]
+    min_kernel = min(times_kernel)
+    max_kernel = max(times_kernel)
+    std_kernel = (sum((t - mean_kernel)**2 for t in times_kernel) / len(times_kernel))**0.5
     
-    # Results
-    speedup = mean_ref / mean_kernel
-    
-    # Calculate improvement over previous phases
-    phase1_baseline = 0.785
-    phase2_baseline = 0.911
+    # Results - use median for more stable measurement
+    speedup_mean = mean_ref / mean_kernel
+    speedup_median = median_ref / median_kernel
+    speedup_best = min_ref / min_kernel
     
     print(f"\n{'='*70}")
     print("PERFORMANCE RESULTS:")
     print(f"{'='*70}")
-    print(f"Reference (JAX):        {mean_ref*1000:.3f} ms")
-    print(f"Phase 3 Kernel:         {mean_kernel*1000:.3f} ms")
-    print(f"Speedup:                {speedup:.3f}×")
-    print(f"\nProgress:")
-    print(f"  Phase 1 baseline:     {phase1_baseline:.3f}×")
-    print(f"  Phase 2 baseline:     {phase2_baseline:.3f}×")
-    print(f"  Phase 3 (current):    {speedup:.3f}×")
-    print(f"  vs Phase 2:           {((speedup/phase2_baseline - 1)*100):+.1f}%")
-    print(f"  vs Original (0.66×):  {((speedup/0.66 - 1)*100):+.1f}%")
+    print(f"\nReference (JAX):")
+    print(f"  Mean:   {mean_ref*1000:.3f} ms (±{std_ref*1000:.3f})")
+    print(f"  Median: {median_ref*1000:.3f} ms")
+    print(f"  Range:  {min_ref*1000:.3f} - {max_ref*1000:.3f} ms")
+    
+    print(f"\nOptimized Kernel:")
+    print(f"  Mean:   {mean_kernel*1000:.3f} ms (±{std_kernel*1000:.3f})")
+    print(f"  Median: {median_kernel*1000:.3f} ms")
+    print(f"  Range:  {min_kernel*1000:.3f} - {max_kernel*1000:.3f} ms")
+    
+    print(f"\nSpeedup:")
+    print(f"  Mean:   {speedup_mean:.3f}×")
+    print(f"  Median: {speedup_median:.3f}×  ← Most reliable")
+    print(f"  Best:   {speedup_best:.3f}×")
+    
+    print(f"\nProgress (using median):")
+    print(f"  Original baseline:    0.66×")
+    print(f"  Phase 1 (carry):      0.785×")
+    print(f"  Phase 2 (blocks):     0.911×")
+    print(f"  Current (median):     {speedup_median:.3f}×")
+    print(f"  Total improvement:    {((speedup_median/0.66 - 1)*100):+.1f}%")
+    
+    # Use median for consistency
+    speedup = speedup_median
     
     # Analysis
     if speedup >= 1.0:
@@ -288,10 +309,10 @@ def main():
         print("   → Small tweaks should get past 1.0×")
         print("   → Then focus on reaching 2× target")
     else:
-        print("⚠️  Phase 3 didn't provide expected gains")
-        print("   → Debug: TPU utilization, memory patterns")
-        print("   → Profile: Instruction-level analysis")
-        print("   → Consider: Revisit algorithm approach")
+        print("⚠️  Still slower than baseline (expected ~0.91-0.95×)")
+        print("   → Note: Performance varies ±5-10% between runs")
+        print("   → Use median speedup for reliable measurement")
+        print("   → Phase 2 is final - Phase 3 attempts regressed")
     
     print("="*70)
 
