@@ -109,7 +109,6 @@ def kascade_attention_kernel(
     
     # Main computation loop over K/V blocks
     # Phase 1: Keep m, l in carry to avoid scratch buffer reads
-    # Phase 3: Simplify computation order for better pipelining
     def body(kv_compute_idx, carry):
         """Process one K/V compute block."""
         m_prev, l_prev = carry  # [bq, 1] - kept in registers, not memory!
@@ -117,31 +116,29 @@ def kascade_attention_kernel(
         # Slice current K/V block
         slice_k = pl.ds(kv_compute_idx * bkv_compute, bkv_compute)
         
-        # Load Q, K for attention computation
+        # Compute Q @ K^T for this block (with scaling)
         q = q_ref[...]  # [bq, head_dim]
         k = k_sparse_ref[slice_k, :]  # [bkv_compute, head_dim]
-        
-        # Compute Q @ K^T with scaling
         qk = lax.dot_general(q, k, NT_DIM_NUMBERS, preferred_element_type=float32)
-        qk = qk / jnp.sqrt(float32(head_dim_v))
+        qk = qk / jnp.sqrt(float32(head_dim_v))  # Scale by 1/sqrt(d)
         
         # Online softmax: update max
         m_curr = qk.max(axis=-1, keepdims=True)  # [bq, 1]
         m_next = jnp.maximum(m_prev, m_curr)
         
-        # Phase 3: Compute both exp values back-to-back (better for instruction cache)
+        # Compute exp(qk - m_next) and sum  
         s_curr = jnp.exp(qk - m_next)
-        alpha = jnp.exp(m_prev - m_next)
-        
-        # Update running sum  
         l_curr = s_curr.sum(axis=-1, keepdims=True)  # [bq, 1]
+        
+        # Update running sum with correction factor
+        alpha = jnp.exp(m_prev - m_next)  # [bq, 1]
         l_next = l_curr + alpha * l_prev
         
-        # Load V and compute output
-        v = v_sparse_ref[slice_k, :].astype(float32)
+        # Compute weighted output: s_curr @ V
+        v = v_sparse_ref[slice_k, :].astype(float32)  # [bkv_compute, head_dim]
         o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS, preferred_element_type=float32)
         
-        # Update output accumulator
+        # Update output accumulator with correction
         o_scratch_ref[:] = alpha * o_scratch_ref[:] + o_curr
         
         return (m_next, l_next)
