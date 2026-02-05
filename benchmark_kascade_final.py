@@ -481,25 +481,39 @@ def main():
             try:
                 # Step 1: Load splash_attention_kernel first
                 import importlib.util
+                import traceback
+                
                 kernel_path = os.path.join(src_path, "MaxText/kernels/splash_attention_kernel.py")
                 kernel_path = os.path.abspath(kernel_path)
                 
+                print(f"\n🔧 Loading splash_attention_kernel from: {kernel_path}")
+                print(f"   File exists: {os.path.exists(kernel_path)}")
+                
                 kernel_spec = importlib.util.spec_from_file_location("splash_attention_kernel_direct", kernel_path)
                 kernel_module = importlib.util.module_from_spec(kernel_spec)
+                print("   ✓ Kernel spec created")
+                
                 kernel_spec.loader.exec_module(kernel_module)
+                print("   ✓ Kernel module loaded")
                 
                 # Step 2: Load kascade_splash_attention and inject the kernel module
                 splash_path = os.path.join(src_path, "MaxText/layers/kascade_splash_attention.py")
                 splash_path = os.path.abspath(splash_path)
                 
+                print(f"🔧 Loading kascade_splash_attention from: {splash_path}")
+                print(f"   File exists: {os.path.exists(splash_path)}")
+                
                 spec = importlib.util.spec_from_file_location("kascade_splash_attention", splash_path)
                 kascade_splash_module = importlib.util.module_from_spec(spec)
+                print("   ✓ Splash spec created")
                 
                 # Inject the kernel module before execution
                 kascade_splash_module._KERNEL_MODULE = kernel_module
                 kascade_splash_module.__file__ = splash_path
+                print("   ✓ Kernel module injected")
                 
                 spec.loader.exec_module(kascade_splash_module)
+                print("   ✓ Splash module loaded")
                 
                 # Store in sys.modules so LlamaBlock can import it
                 sys.modules['kascade_splash_attention'] = kascade_splash_module
@@ -507,6 +521,9 @@ def main():
                 print("\n✅ SplashAttention kernel available - will use optimized implementation")
             except Exception as e:
                 print(f"\n⚠️  WARNING: Could not import kascade_splash_attention: {e}")
+                print(f"   Error type: {type(e).__name__}")
+                print("   Traceback:")
+                traceback.print_exc()
                 print("   Falling back to standard Kascade implementation")
                 args.use_splash_kernel = False
     
