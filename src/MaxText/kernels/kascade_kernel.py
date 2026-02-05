@@ -1,0 +1,347 @@
+"""
+Kascade Custom TPU Kernel
+==========================
+Optimized Pallas kernel for Kascade sparse attention on TPU.
+
+Adapts techniques from SplashAttention for arbitrary sparse patterns:
+- Block-wise computation with online softmax
+- Efficient memory access patterns
+- TPU-optimized tiling strategy
+
+Key Differences from SplashAttention:
+- Works with pre-gathered sparse K/V (no structured masking)
+- Arbitrary tile indices (not causal/local patterns)
+- Optimized for Q @ K_sparse^T where sparse_len << seq_len
+
+Performance Target: 2-3× speedup vs JAX implementation on TPU
+"""
+
+import functools
+from typing import Any, Callable, Literal, NamedTuple
+
+import jax
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
+import numpy as np
+
+# TPU constants
+NUM_LANES = 128
+NUM_SUBLANES = 8
+DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+
+# Dimension numbers for matmul
+NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # standard matmul
+NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))  # RHS transposed
+
+
+class KascadeBlockSizes(NamedTuple):
+    """Block sizes for Kascade kernel.
+    
+    Args:
+        block_q: Query block size (must be multiple of NUM_LANES=128)
+        block_kv_sparse: Sparse K/V block size (must be multiple of NUM_LANES=128)
+        block_kv_compute: K/V compute block size (must divide block_kv_sparse)
+    """
+    block_q: int = 512
+    block_kv_sparse: int = 256  # Sparse K/V length is much smaller
+    block_kv_compute: int | None = None
+    
+    def __post_init__(self):
+        if self.block_kv_compute is None:
+            object.__setattr__(self, 'block_kv_compute', min(128, self.block_kv_sparse))
+
+
+def kascade_attention_kernel(
+    # Inputs
+    q_ref,  # [block_q, head_dim]
+    k_sparse_ref,  # [block_kv_sparse, head_dim]
+    v_sparse_ref,  # [block_kv_sparse, head_dim]
+    # Outputs
+    m_scratch_ref,  # [block_q, NUM_LANES] - max logits (for online softmax)
+    l_scratch_ref,  # [block_q, NUM_LANES] - sum of exp (for online softmax)
+    o_scratch_ref,  # [block_q, head_dim] - output accumulator
+    o_ref,  # [block_q, head_dim] - final output
+    # Parameters
+    *,
+    mask_value: float,
+    bq: int,
+    bkv_sparse: int,
+    bkv_compute: int,
+    head_dim_v: int,
+    grid_width: int,
+):
+    """
+    Kascade attention kernel for one Q block × sparse K/V.
+    
+    Implements online softmax algorithm:
+    1. Compute Q @ K_sparse^T in blocks
+    2. Update running max (m) and sum (l) for numerical stability
+    3. Accumulate weighted output (o) with correction factors
+    4. Final normalization by l
+    
+    This is adapted from SplashAttention's flash_attention_kernel but:
+    - No masking logic (K/V already sparse)
+    - No data_next prefetching (simple linear scan)
+    - Simpler indexing (no shrinking iteration space)
+    """
+    float32 = jnp.float32
+    
+    # Get grid indices (same as SplashAttention)
+    h, i, j = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+    
+    # Validate head_dim_v is multiple of NUM_LANES (same as SplashAttention requirement)
+    head_dim_v_repeats, rem = divmod(head_dim_v, NUM_LANES)
+    if rem != 0:
+        raise NotImplementedError(f"{head_dim_v=} should be a multiple of {NUM_LANES}")
+    
+    # Validate bkv_compute is multiple of NUM_LANES
+    bkv_repeats, rem = divmod(bkv_compute, NUM_LANES)
+    if rem != 0:
+        raise NotImplementedError(f"{bkv_compute=} should be a multiple of {NUM_LANES}")
+    
+    # Initialize accumulators at start of sequence
+    @pl.when(j == 0)
+    def init():
+        o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+        m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+        l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    
+    # Main computation loop over K/V blocks
+    def body(kv_compute_idx, _):
+        """Process one K/V compute block."""
+        # Slice current K/V block
+        slice_k = pl.ds(kv_compute_idx * bkv_compute, bkv_compute)
+        
+        # Get previous running statistics
+        m_prev = m_scratch_ref[...]  # [bq, NUM_LANES]
+        l_prev = l_scratch_ref[...]  # [bq, NUM_LANES]
+        assert m_prev.shape == (bq, NUM_LANES)
+        assert l_prev.shape == (bq, NUM_LANES)
+        
+        # Compute Q @ K^T for this block
+        q = q_ref[...]  # [bq, head_dim]
+        k = k_sparse_ref[slice_k, :]  # [bkv_compute, head_dim]
+        qk = lax.dot_general(q, k, NT_DIM_NUMBERS, preferred_element_type=float32)
+        assert qk.shape == (bq, bkv_compute)
+        
+        # Online softmax: update max
+        m_curr = qk.max(axis=-1)[:, None]  # [bq, 1]
+        assert m_curr.shape == (bq, 1)
+        m_next = jnp.maximum(m_prev, m_curr)
+        assert m_next.shape == (bq, NUM_LANES)
+        
+        # Compute exp(qk - m_next) and sum
+        s_curr = jnp.exp(qk - pltpu.repeat(m_next, bkv_repeats, axis=1))
+        assert s_curr.shape == (bq, bkv_compute)
+        
+        l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
+        assert l_curr.shape == (bq, NUM_LANES)
+        
+        # Update running sum with correction factor
+        alpha = jnp.exp(m_prev - m_next)
+        l_next = l_curr + alpha * l_prev
+        m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
+        
+        # Compute weighted output: s_curr @ V
+        v = v_sparse_ref[slice_k, :].astype(float32)  # [bkv_compute, head_dim]
+        o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS)
+        
+        # Update output accumulator with correction
+        alpha_o = pltpu.repeat(alpha, head_dim_v_repeats, axis=1)
+        o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
+    
+    # Run the loop over all K/V compute blocks
+    num_iters = bkv_sparse // bkv_compute
+    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    
+    # Final normalization at end of sequence
+    @pl.when(j == grid_width - 1)
+    def end():
+        l = l_scratch_ref[...]
+        l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
+        o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
+        
+        m_scratch_ref[...] = jnp.zeros_like(m_scratch_ref)
+        l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+        o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+
+
+def kascade_attention_forward(
+    q: jax.Array,  # [num_heads, q_seq_len, head_dim]
+    k_sparse: jax.Array,  # [num_heads, sparse_len, head_dim]
+    v_sparse: jax.Array,  # [num_heads, sparse_len, head_dim]
+    block_sizes: KascadeBlockSizes | None = None,
+) -> jax.Array:
+    """
+    Kascade attention forward pass using custom Pallas kernel.
+    
+    Args:
+        q: Query tensor [num_heads, q_seq_len, head_dim]
+        k_sparse: Sparse key tensor [num_heads, sparse_len, head_dim]
+        v_sparse: Sparse value tensor [num_heads, sparse_len, head_dim]
+        block_sizes: Block tiling configuration
+        
+    Returns:
+        output: Attention output [num_heads, q_seq_len, head_dim]
+    """
+    if block_sizes is None:
+        block_sizes = KascadeBlockSizes()
+    
+    num_heads, q_seq_len, head_dim_qk = q.shape
+    _, sparse_len, head_dim_v = v_sparse.shape
+    
+    # Handle small sparse_len by padding to NUM_LANES
+    if sparse_len < NUM_LANES:
+        pad_len = NUM_LANES - sparse_len
+        k_sparse = jnp.pad(k_sparse, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
+        v_sparse = jnp.pad(v_sparse, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
+        sparse_len = NUM_LANES
+    
+    bq = block_sizes.block_q
+    bkv_sparse = min(block_sizes.block_kv_sparse, sparse_len)
+    # Round bkv_sparse up to nearest multiple of NUM_LANES
+    bkv_sparse = ((bkv_sparse + NUM_LANES - 1) // NUM_LANES) * NUM_LANES
+    bkv_compute = block_sizes.block_kv_compute or min(NUM_LANES, bkv_sparse)
+    # Ensure bkv_compute is multiple of NUM_LANES
+    bkv_compute = max(NUM_LANES, bkv_compute)
+    
+    # Validate shapes
+    if k_sparse.shape != (num_heads, sparse_len, head_dim_qk):
+        raise ValueError(
+            f"k_sparse shape {k_sparse.shape} doesn't match "
+            f"expected ({num_heads}, {sparse_len}, {head_dim_qk})"
+        )
+    
+    if bkv_sparse % bkv_compute != 0:
+        raise ValueError(f"{bkv_sparse=} must be multiple of {bkv_compute=}")
+    
+    if bkv_compute % NUM_LANES != 0:
+        raise ValueError(f"{bkv_compute=} must be multiple of {NUM_LANES}")
+    
+    if bq % NUM_LANES != 0:
+        raise ValueError(f"{bq=} must be multiple of {NUM_LANES}")
+    
+    # Grid: (num_heads, num_q_blocks, 1)
+    num_q_blocks = (q_seq_len + bq - 1) // bq
+    grid = (num_heads, num_q_blocks, 1)
+    grid_width = 1  # Simple linear scan (no shrinking like SplashAttention)
+    
+    # Index maps for Pallas
+    def q_index_map(h, i, j):
+        return h, i, 0
+    
+    def k_sparse_index_map(h, i, j):
+        return h, 0, 0  # K/V are same for all Q blocks
+    
+    def v_sparse_index_map(h, i, j):
+        return h, 0, 0
+    
+    def out_index_map(h, i, j):
+        return h, i, 0
+    
+    # BlockSpecs for inputs/outputs
+    in_specs = [
+        pl.BlockSpec((None, bq, head_dim_qk), q_index_map),  # q
+        pl.BlockSpec((None, bkv_sparse, head_dim_qk), k_sparse_index_map),  # k_sparse
+        pl.BlockSpec((None, bkv_sparse, head_dim_v), v_sparse_index_map),  # v_sparse
+    ]
+    
+    out_specs = pl.BlockSpec((None, bq, head_dim_v), out_index_map)
+    
+    # Scratch space for online softmax (in VMEM)
+    scratch_shapes = [
+        pltpu.VMEM((bq, NUM_LANES), jnp.float32),  # m_scratch
+        pltpu.VMEM((bq, NUM_LANES), jnp.float32),  # l_scratch
+        pltpu.VMEM((bq, head_dim_v), jnp.float32),  # o_scratch
+    ]
+    
+    # Create kernel with parameters
+    kernel = functools.partial(
+        kascade_attention_kernel,
+        mask_value=DEFAULT_MASK_VALUE,
+        bq=bq,
+        bkv_sparse=bkv_sparse,
+        bkv_compute=bkv_compute,
+        head_dim_v=head_dim_v,
+        grid_width=grid_width,
+    )
+    
+    # Call Pallas (no special compiler_params needed for TPU)
+    output = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim_v), q.dtype),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        scratch_shapes=scratch_shapes,
+        grid=grid,
+    )(q, k_sparse, v_sparse)
+    
+    return output
+
+
+def make_kascade_kernel(
+    block_sizes: KascadeBlockSizes | None = None,
+):
+    """
+    Create a JIT-compiled Kascade attention function.
+    
+    Args:
+        block_sizes: Block tiling configuration
+        
+    Returns:
+        Callable that computes Kascade attention with custom kernel
+    """
+    
+    @jax.jit
+    def _kascade_attention(
+        q: jax.Array,
+        k_sparse: jax.Array,
+        v_sparse: jax.Array,
+    ) -> jax.Array:
+        """
+        Compute Kascade attention: Q @ K_sparse^T @ V_sparse.
+        
+        Args:
+            q: [num_heads, q_seq_len, head_dim]
+            k_sparse: [num_heads, sparse_len, head_dim]
+            v_sparse: [num_heads, sparse_len, head_dim]
+            
+        Returns:
+            output: [num_heads, q_seq_len, head_dim]
+        """
+        return kascade_attention_forward(q, k_sparse, v_sparse, block_sizes)
+    
+    return _kascade_attention
+
+
+# Reference JAX implementation for correctness testing
+def kascade_attention_reference(
+    q: jax.Array,  # [num_heads, q_seq_len, head_dim]
+    k_sparse: jax.Array,  # [num_heads, sparse_len, head_dim]
+    v_sparse: jax.Array,  # [num_heads, sparse_len, head_dim]
+) -> jax.Array:
+    """
+    Reference implementation using pure JAX (for testing).
+    
+    This is the baseline to compare our custom kernel against.
+    """
+    # Q @ K^T
+    logits = jnp.einsum('hqd,hkd->hqk', q, k_sparse) / jnp.sqrt(q.shape[-1])
+    
+    # Softmax
+    weights = jax.nn.softmax(logits, axis=-1)
+    
+    # Weights @ V
+    output = jnp.einsum('hqk,hkd->hqd', weights, v_sparse)
+    
+    return output
+
+
+__all__ = [
+    'kascade_attention_forward',
+    'kascade_attention_reference',
+    'make_kascade_kernel',
+    'KascadeBlockSizes',
+]

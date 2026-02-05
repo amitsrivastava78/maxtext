@@ -1,90 +1,88 @@
 """
-Kascade + SplashAttention: Optimized Sparse Attention
-======================================================
-Combines Kascade's data-driven tile selection with MaxText's optimized SplashAttention kernel.
+Kascade Sparse Attention with Custom TPU Kernel
+================================================
+Implements Kascade sparse attention using a custom Pallas kernel optimized for TPU.
 
-Key Benefits:
-- Kascade calibration: Select important tiles dynamically
-- SplashAttention kernel: Fused, hardware-optimized computation  
-- Expected speedup: 2-3× on TPU for 7B+ models
+Architecture:
+1. Tile Selection: Select important K/V tiles via calibration (ANCHOR) or reuse (REUSE)
+2. Sparse Gather: Extract K/V from selected tiles (reduces to sparse_len << seq_len)
+3. Custom Kernel: Optimized block-wise computation with online softmax
+
+Custom Kernel Features (adapted from SplashAttention):
+- Block-wise tiling for efficient TPU memory access
+- Online softmax algorithm for numerical stability
+- Fused operations to minimize memory bandwidth
+- Optimized for arbitrary sparse patterns (not just causal/local)
+
+Expected speedup: 2-3× on TPU from both sparsity AND kernel-level optimization
 """
 
 import jax
 import jax.numpy as jnp
-import functools
 import sys
 
-# Module-level variable that will be set by the loader
-_KERNEL_MODULE = None
-
-# Import splash attention mask from JAX
-from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
-
-# Use the pre-loaded kernel module if available
-if _KERNEL_MODULE is not None:
-    splash_attention_kernel = _KERNEL_MODULE
-else:
-    # Fallback: try to import from JAX (won't work, but needed for structure)
-    try:
-        from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
-    except ImportError:
-        splash_attention_kernel = None
+# Import custom Kascade kernel
+try:
+    from MaxText.kernels.kascade_kernel import (
+        make_kascade_kernel,
+        KascadeBlockSizes,
+        kascade_attention_reference,
+    )
+    KASCADE_KERNEL_AVAILABLE = True
+except ImportError:
+    KASCADE_KERNEL_AVAILABLE = False
+    print("⚠️  Kascade custom kernel not available, falling back to JAX implementation")
 
 # Cache for tile selections across layers
 KASCADE_TILE_CACHE = {}
 
 
-class KascadeMask(splash_attention_mask._ComputableMask):  # pylint: disable=protected-access
+def gather_sparse_kv(K, V, tile_indices, tile_size):
     """
-    Custom mask for SplashAttention that uses Kascade's tile selections.
+    Gather K and V from selected tiles to create sparse tensors.
     
-    This mask converts Kascade's selected tile indices into a sparse attention mask
-    that SplashAttention can consume efficiently.
+    Args:
+        K: [batch, seq_len, heads, head_dim]
+        V: [batch, seq_len, heads, head_dim]
+        tile_indices: [batch, heads, top_k] indices of selected tiles
+        tile_size: Size of each tile
+        
+    Returns:
+        K_sparse: [batch, sparse_len, heads, head_dim]
+        V_sparse: [batch, sparse_len, heads, head_dim]
     """
+    batch, seq_len, heads, head_dim = K.shape
+    _, _, top_k = tile_indices.shape
     
-    def __init__(self, tile_indices, tile_size, seq_len):
-        """
-        Args:
-            tile_indices: [batch, heads, top_k] indices of selected tiles
-            tile_size: Size of each tile in tokens
-            seq_len: Total sequence length
-        """
-        self.tile_indices = tile_indices
-        self.tile_size = tile_size
-        self.seq_len = seq_len
+    # Convert tile indices to token indices
+    # Each tile index maps to a range [tile_idx * tile_size : (tile_idx+1) * tile_size]
+    # We'll gather all tokens from selected tiles
     
-    @property
-    def shape(self):
-        """Return the shape of the mask (seq_len, seq_len)"""
-        return (self.seq_len, self.seq_len)
+    # Expand tile_indices to token indices: [batch, heads, top_k, tile_size]
+    tile_idx_expanded = tile_indices[:, :, :, None]  # [B, H, K, 1]
+    offsets = jnp.arange(tile_size)[None, None, None, :]  # [1, 1, 1, T]
+    token_indices = tile_idx_expanded * tile_size + offsets  # [B, H, K, T]
     
-    def __hash__(self):
-        """Hash for mask caching in SplashAttention"""
-        # Hash based on tile_size and seq_len (tile_indices are runtime values)
-        return hash((type(self).__name__, self.tile_size, self.seq_len))
+    # Flatten to [batch, heads, sparse_len] where sparse_len = top_k * tile_size
+    token_indices = token_indices.reshape(batch, heads, -1)  # [B, H, sparse_len]
     
-    def __call__(self, q_idx, kv_idx):
-        """
-        Mask function called by SplashAttention kernel.
-        
-        Returns True if kv_idx is within a selected tile for q_idx.
-        """
-        # Determine which tile kv_idx belongs to
-        kv_tile = kv_idx // self.tile_size
-        
-        # Check if this tile is in the selected tiles for this query
-        # This is a simplified version - in practice, SplashAttention
-        # handles this more efficiently with block-level masking
-        return self._is_tile_selected(q_idx, kv_tile)
+    # Gather K and V
+    # K/V are [batch, seq_len, heads, head_dim]
+    # We need to gather along seq_len dimension for each head
     
-    def _is_tile_selected(self, q_idx, kv_tile):
-        """Check if kv_tile is in the selected tiles for query q_idx"""
-        # This would be implemented efficiently in the actual kernel
-        # For now, this is a placeholder showing the logic
-        batch_idx = 0  # Assuming single batch
-        head_idx = 0   # Would need to be parameterized
-        selected = self.tile_indices[batch_idx, head_idx]
-        return jnp.any(selected == kv_tile)
+    # Reshape for gathering: [batch, heads, seq_len, head_dim]
+    K_transposed = jnp.transpose(K, (0, 2, 1, 3))
+    V_transposed = jnp.transpose(V, (0, 2, 1, 3))
+    
+    # Gather: [batch, heads, sparse_len, head_dim]
+    K_sparse = jnp.take_along_axis(K_transposed, token_indices[..., None], axis=2)
+    V_sparse = jnp.take_along_axis(V_transposed, token_indices[..., None], axis=2)
+    
+    # Transpose back to [batch, sparse_len, heads, head_dim]
+    K_sparse = jnp.transpose(K_sparse, (0, 2, 1, 3))
+    V_sparse = jnp.transpose(V_sparse, (0, 2, 1, 3))
+    
+    return K_sparse, V_sparse
 
 
 def kascade_calibrate_tiles(Q, K, tile_size=64, top_k_ratio=0.25):
@@ -104,21 +102,19 @@ def kascade_calibrate_tiles(Q, K, tile_size=64, top_k_ratio=0.25):
     num_tiles = seq_len // tile_size
     top_k = max(1, int(num_tiles * top_k_ratio))
     
-    # Reshape for tile-based processing
-    Q_reshaped = Q.reshape(batch, seq_len, heads, head_dim)
+    # Reshape K into tiles: [batch, num_tiles, tile_size, heads, head_dim]
     K_tiled = K.reshape(batch, num_tiles, tile_size, heads, head_dim)
     
-    # Max pool K tiles to get tile summary
-    K_summary = jnp.max(K_tiled, axis=2)  # [batch, num_tiles, heads, head_dim]
+    # Max pool K tiles to get tile summary: [batch, num_tiles, heads, head_dim]
+    K_summary = jnp.max(K_tiled, axis=2)
     
     # Compute Q @ K_summary for each head
     # Q: [batch, seq_len, heads, head_dim]
     # K_summary: [batch, num_tiles, heads, head_dim]
-    tile_scores = jnp.einsum('bqhd,bnhd->bqhn', Q_reshaped, K_summary)
+    tile_scores = jnp.einsum('bqhd,bnhd->bqhn', Q, K_summary)
     tile_scores = tile_scores / jnp.sqrt(head_dim)
     
-    # Select top-k tiles per query per head
-    # Use mean over queries to get global tile importance per head
+    # Select top-k tiles per head (average over queries)
     tile_scores_mean = jnp.mean(tile_scores, axis=1)  # [batch, heads, num_tiles]
     
     # Get top-k tile indices
@@ -139,10 +135,15 @@ def kascade_splash_attention(
     top_k_ratio=0.25,
 ):
     """
-    Kascade + SplashAttention: Optimized sparse attention.
+    Kascade sparse attention with custom TPU kernel.
+    
+    Strategy:
+    1. Select important tiles via Kascade calibration (ANCHOR) or reuse (REUSE)
+    2. Gather sparse K/V from those tiles (reduces FLOPs)
+    3. Run custom kernel on Q × K_sparse (fast kernel execution)
     
     Args:
-        query, key, value: Attention inputs
+        query, key, value: Attention inputs [batch, seq_len, heads, head_dim]
         layer_id: Current layer index
         is_anchor_layer: If True, compute tile selection. If False, reuse from anchor.
         anchor_layer_id: Which anchor layer to reuse tiles from (for REUSE layers)
@@ -173,36 +174,51 @@ def kascade_splash_attention(
             # Fallback: compute if not found
             tile_indices = kascade_calibrate_tiles(query, key, tile_size, top_k_ratio)
     
-    # Step 2: Create sparse mask from tile selections
-    # For each head, create a mask that allows attention only to selected tiles
-    kascade_mask = KascadeMask(tile_indices, tile_size, seq_len)
+    # Step 2: Gather sparse K/V from selected tiles
+    key_sparse, value_sparse = gather_sparse_kv(key, value, tile_indices, tile_size)
+    # key_sparse, value_sparse: [batch, sparse_len, heads, head_dim] where sparse_len << seq_len
+    sparse_len = key_sparse.shape[1]
     
-    # Create multi-head mask for SplashAttention
-    multi_head_mask = splash_attention_mask.MultiHeadMask(
-        masks=(kascade_mask,) * heads
-    )
-    
-    # Step 3: Configure SplashAttention kernel
-    block_sizes = splash_attention_kernel.BlockSizes(
-        block_q=min(512, seq_len),
-        block_kv=min(tile_size, seq_len),
-        block_kv_compute=min(tile_size, seq_len),
-        block_q_dkv=min(512, seq_len),
-        block_kv_dkv=min(tile_size, seq_len),
-    )
-    
-    # Step 4: Create and execute SplashAttention kernel
-    splash_kernel = splash_attention_kernel.make_splash_mha(
-        mask=multi_head_mask,
-        head_shards=1,
-        q_seq_shards=1,
-        block_sizes=block_sizes,
-        attn_logits_soft_cap=None,
-    )
-    
-    # Reshape for SplashAttention: [batch, seq_len, heads, head_dim]
-    # SplashAttention expects specific format
-    output = splash_kernel(query, key, value)
+    # Step 3: Run custom kernel if available, otherwise use JAX reference
+    if KASCADE_KERNEL_AVAILABLE:
+        # Reshape for custom kernel: [batch, seq_len, heads, head_dim] -> [batch*heads, seq_len, head_dim]
+        q_reshaped = query.reshape(batch * heads, seq_len, head_dim)
+        k_sparse_reshaped = key_sparse.reshape(batch * heads, sparse_len, head_dim)
+        v_sparse_reshaped = value_sparse.reshape(batch * heads, sparse_len, head_dim)
+        
+        # Transpose to [num_heads, seq_len, head_dim] format expected by kernel
+        q_transposed = jnp.transpose(q_reshaped, (0, 1, 2))  # Already correct order
+        k_sparse_transposed = jnp.transpose(k_sparse_reshaped, (0, 1, 2))
+        v_sparse_transposed = jnp.transpose(v_sparse_reshaped, (0, 1, 2))
+        
+        # Configure block sizes
+        block_sizes = KascadeBlockSizes(
+            block_q=min(512, seq_len),
+            block_kv_sparse=min(256, sparse_len),
+            block_kv_compute=min(128, sparse_len),
+        )
+        
+        # Create and call kernel
+        kernel_fn = make_kascade_kernel(block_sizes)
+        output_transposed = kernel_fn(q_transposed, k_sparse_transposed, v_sparse_transposed)
+        
+        # Reshape back: [batch*heads, seq_len, head_dim] -> [batch, seq_len, heads, head_dim]
+        output = output_transposed.reshape(batch, heads, seq_len, head_dim)
+        output = jnp.transpose(output, (0, 2, 1, 3))  # -> [batch, seq_len, heads, head_dim]
+    else:
+        # Fallback: Use JAX reference implementation
+        # Transpose to [batch, heads, seq_len, head_dim]
+        q_t = jnp.transpose(query, (0, 2, 1, 3))
+        k_sparse_t = jnp.transpose(key_sparse, (0, 2, 1, 3))
+        v_sparse_t = jnp.transpose(value_sparse, (0, 2, 1, 3))
+        
+        # Attention: Q @ K^T @ V
+        logits = jnp.einsum('bhqd,bhkd->bhqk', q_t, k_sparse_t) / jnp.sqrt(head_dim)
+        weights = jax.nn.softmax(logits, axis=-1)
+        output_t = jnp.einsum('bhqk,bhkd->bhqd', weights, v_sparse_t)
+        
+        # Transpose back
+        output = jnp.transpose(output_t, (0, 2, 1, 3))  # -> [batch, seq_len, heads, head_dim]
     
     return output
 
@@ -247,7 +263,8 @@ def create_kascade_splash_schedule(num_layers, threshold=0.5, max_reuse_dist=4):
 __all__ = [
     'kascade_splash_attention',
     'kascade_calibrate_tiles',
+    'gather_sparse_kv',
     'create_kascade_splash_schedule',
-    'KascadeMask',
     'KASCADE_TILE_CACHE',
+    'KASCADE_KERNEL_AVAILABLE',
 ]
