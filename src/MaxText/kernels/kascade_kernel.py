@@ -117,10 +117,11 @@ def kascade_attention_kernel(
         assert m_prev.shape == (bq, NUM_LANES)
         assert l_prev.shape == (bq, NUM_LANES)
         
-        # Compute Q @ K^T for this block
+        # Compute Q @ K^T for this block (with scaling)
         q = q_ref[...]  # [bq, head_dim]
         k = k_sparse_ref[slice_k, :]  # [bkv_compute, head_dim]
         qk = lax.dot_general(q, k, NT_DIM_NUMBERS, preferred_element_type=float32)
+        qk = qk / jnp.sqrt(float32(head_dim_v))  # Scale by 1/sqrt(d)
         assert qk.shape == (bq, bkv_compute)
         
         # Online softmax: update max
