@@ -182,8 +182,8 @@ def kascade_splash_attention(
         block_q=min(512, seq_len),
         block_kv=min(tile_size, seq_len),
         block_kv_compute=min(tile_size, seq_len),
-        block_q_major_dkv=min(512, seq_len),
-        block_kv_major_dkv=min(tile_size, seq_len),
+        block_q_dkv=min(512, seq_len),
+        block_kv_dkv=min(tile_size, seq_len),
     )
     
     # Step 4: Create and execute SplashAttention kernel
