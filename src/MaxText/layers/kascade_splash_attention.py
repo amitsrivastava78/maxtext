@@ -11,10 +11,29 @@ Key Benefits:
 
 import jax
 import jax.numpy as jnp
-# Import MaxText's splash attention (which internally uses JAX's pallas implementation)
-from MaxText.kernels import splash_attention_kernel
-from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 import functools
+import sys
+import os
+
+# Import splash attention components
+# Use direct file loading to avoid MaxText's __init__.py dependency chain
+def _load_splash_kernel():
+    """Load splash_attention_kernel module directly"""
+    import importlib.util
+    kernel_path = os.path.join(os.path.dirname(__file__), '../kernels/splash_attention_kernel.py')
+    spec = importlib.util.spec_from_file_location("splash_attention_kernel_direct", kernel_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+# Try to load splash_attention_kernel
+try:
+    splash_attention_kernel = _load_splash_kernel()
+except Exception:
+    # Fallback: might be in JAX on TPU
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
 # Cache for tile selections across layers
 KASCADE_TILE_CACHE = {}

@@ -293,8 +293,13 @@ class LlamaBlock(nn.Module):
         
         # Use SplashAttention kernel if enabled (TPU only)
         if self.use_splash and USE_SPLASH_KERNEL:
-            # Import here to avoid issues on CPU
-            from MaxText.layers.kascade_splash_attention import kascade_splash_attention
+            # Import the module that was loaded in main()
+            import sys
+            kascade_splash_module = sys.modules.get('kascade_splash_attention')
+            if kascade_splash_module is None:
+                raise ImportError("kascade_splash_attention not loaded")
+            
+            kascade_splash_attention = kascade_splash_module.kascade_splash_attention
             
             # For splash kernel, we need Q, K, V explicitly
             # Compute them using Dense layers (matching the attention module structure)
@@ -474,9 +479,18 @@ def main():
             args.use_splash_kernel = False
         else:
             try:
-                from MaxText.layers import kascade_splash_attention
+                # Direct import to avoid MaxText's __init__.py dependency chain
+                import importlib.util
+                splash_path = os.path.join(src_path, "MaxText/layers/kascade_splash_attention.py")
+                spec = importlib.util.spec_from_file_location("kascade_splash_attention", splash_path)
+                kascade_splash_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(kascade_splash_module)
+                
+                # Store in sys.modules so LlamaBlock can import it
+                sys.modules['kascade_splash_attention'] = kascade_splash_module
+                
                 print("\n✅ SplashAttention kernel available - will use optimized implementation")
-            except ImportError as e:
+            except Exception as e:
                 print(f"\n⚠️  WARNING: Could not import kascade_splash_attention: {e}")
                 print("   Falling back to standard Kascade implementation")
                 args.use_splash_kernel = False
