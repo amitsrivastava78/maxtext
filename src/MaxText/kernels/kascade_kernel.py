@@ -131,7 +131,12 @@ def kascade_attention_kernel(
         assert m_next.shape == (bq, NUM_LANES)
         
         # Compute exp(qk - m_next) and sum
-        s_curr = jnp.exp(qk - pltpu.repeat(m_next, bkv_repeats, axis=1))
+        # Broadcast m_next from (bq, NUM_LANES) to (bq, bkv_compute)
+        if bkv_compute == NUM_LANES:
+            m_next_broadcast = m_next
+        else:
+            m_next_broadcast = pltpu.repeat(m_next, bkv_repeats, axis=1)
+        s_curr = jnp.exp(qk - m_next_broadcast)
         assert s_curr.shape == (bq, bkv_compute)
         
         l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
@@ -147,7 +152,11 @@ def kascade_attention_kernel(
         o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS)
         
         # Update output accumulator with correction
-        alpha_o = pltpu.repeat(alpha, head_dim_v_repeats, axis=1)
+        # Broadcast alpha from (bq, NUM_LANES) to (bq, head_dim_v)
+        if head_dim_v == NUM_LANES:
+            alpha_o = alpha
+        else:
+            alpha_o = pltpu.repeat(alpha, head_dim_v_repeats, axis=1)
         o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
     
     # Run the loop over all K/V compute blocks
@@ -156,7 +165,11 @@ def kascade_attention_kernel(
     
     # Final normalization (always run since grid third dim is 1)
     l = l_scratch_ref[...]
-    l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
+    # Broadcast l_inv from (bq, NUM_LANES) to (bq, head_dim_v)
+    if head_dim_v == NUM_LANES:
+        l_inv = 1.0 / l
+    else:
+        l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
     o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
 
 
