@@ -482,8 +482,14 @@ def main():
                 # Direct import to avoid MaxText's __init__.py dependency chain
                 import importlib.util
                 splash_path = os.path.join(src_path, "MaxText/layers/kascade_splash_attention.py")
+                splash_path = os.path.abspath(splash_path)
+                
                 spec = importlib.util.spec_from_file_location("kascade_splash_attention", splash_path)
                 kascade_splash_module = importlib.util.module_from_spec(spec)
+                
+                # Set __file__ before executing to help with relative imports
+                kascade_splash_module.__file__ = splash_path
+                
                 spec.loader.exec_module(kascade_splash_module)
                 
                 # Store in sys.modules so LlamaBlock can import it
