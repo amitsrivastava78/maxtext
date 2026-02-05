@@ -40,13 +40,14 @@ HEAD_DIM = 64
 EMBED_DIM = 2048
 MLP_DIM = 8192
 VOCAB_SIZE = 128256
-SEQ_LEN = 512
+SEQ_LEN = 512  # Will be overridden by command line arg
 
 # Hyperparameters (Defaults - can be overridden via command line)
 DEFAULT_TILE_SIZE = 16
 DEFAULT_TOP_K = 12  # Optimized for 1B model (paper uses 8 for 8B)
 DEFAULT_THRESHOLD = 0.65  # 65% Jaccard similarity for reuse
 DEFAULT_MAX_REUSE_DIST = 4  # Maximum layers between anchor and reuse
+DEFAULT_SEQ_LEN = 512  # Default sequence length
 DEFAULT_DEVICE = 'cpu'  # Default to CPU for compatibility
 
 # Global variables (set by parse_args)
@@ -371,6 +372,12 @@ def parse_args():
         default=DEFAULT_MAX_REUSE_DIST,
         help="Maximum layer distance between anchor and reuse layers"
     )
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=DEFAULT_SEQ_LEN,
+        help="Sequence length for benchmark (longer = better speedup)"
+    )
     
     # Paths
     parser.add_argument(
@@ -404,15 +411,17 @@ def main():
     print(f"✓ JAX using {len(devices)} {devices[0].platform.upper()} device(s): {[d.id for d in devices]}")
     
     # Update global variables with command line values
-    global TILE_SIZE, TOP_K_OPTIMIZED
+    global TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN
     TILE_SIZE = args.tile_size
     TOP_K_OPTIMIZED = args.top_k
+    SEQ_LEN = args.seq_len
     
     print("\n" + "=" * 70)
     print("🚀 FINAL KASCADE BENCHMARK")
     print("=" * 70)
     print(f"\n⚙️  Configuration:")
     print(f"   Device:           {args.device.upper()}")
+    print(f"   Sequence Length:  {args.seq_len}")
     print(f"   Tile Size:        {args.tile_size}")
     print(f"   Top-K Tiles:      {args.top_k}")
     print(f"   Threshold:        {args.threshold:.2%}")
