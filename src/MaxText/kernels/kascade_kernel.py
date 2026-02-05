@@ -101,68 +101,56 @@ def kascade_attention_kernel(
     if rem != 0:
         raise NotImplementedError(f"{bkv_compute=} should be a multiple of {NUM_LANES}")
     
-    # Initialize accumulators (always run since grid third dim is 1)
+    # Initialize output buffer
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
-    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-    o_ref[...] = jnp.zeros_like(o_ref)  # Also initialize output buffer
+    o_ref[...] = jnp.zeros_like(o_ref)
     
     # Main computation loop over K/V blocks
-    def body(kv_compute_idx, _):
+    # OPTIMIZATION: Keep m, l in carry to avoid scratch buffer reads on every iteration
+    def body(kv_compute_idx, carry):
         """Process one K/V compute block."""
+        m_prev, l_prev = carry  # [bq, 1] - kept in registers, not memory!
+        
         # Slice current K/V block
         slice_k = pl.ds(kv_compute_idx * bkv_compute, bkv_compute)
-        
-        # Get previous running statistics
-        m_prev = m_scratch_ref[...]  # [bq, NUM_LANES]
-        l_prev = l_scratch_ref[...]  # [bq, NUM_LANES]
-        assert m_prev.shape == (bq, NUM_LANES)
-        assert l_prev.shape == (bq, NUM_LANES)
         
         # Compute Q @ K^T for this block (with scaling)
         q = q_ref[...]  # [bq, head_dim]
         k = k_sparse_ref[slice_k, :]  # [bkv_compute, head_dim]
         qk = lax.dot_general(q, k, NT_DIM_NUMBERS, preferred_element_type=float32)
         qk = qk / jnp.sqrt(float32(head_dim_v))  # Scale by 1/sqrt(d)
-        assert qk.shape == (bq, bkv_compute)
         
         # Online softmax: update max
         m_curr = qk.max(axis=-1, keepdims=True)  # [bq, 1]
-        assert m_curr.shape == (bq, 1)
-        m_next = jnp.maximum(m_prev[:, :1], m_curr)  # Use only first lane of m_prev
-        assert m_next.shape == (bq, 1)
-        
-        # Store in all lanes (for consistency with SplashAttention)
-        m_next_all_lanes = jnp.broadcast_to(m_next, (bq, NUM_LANES))
+        m_next = jnp.maximum(m_prev, m_curr)  # Both [bq, 1] - no slicing needed!
         
         # Compute exp(qk - m_next) and sum  
         s_curr = jnp.exp(qk - m_next)  # m_next broadcasts from (bq, 1)
-        assert s_curr.shape == (bq, bkv_compute)
-        
         l_curr = s_curr.sum(axis=-1, keepdims=True)  # [bq, 1]
-        assert l_curr.shape == (bq, 1)
-        
-        # Broadcast to all lanes
-        l_curr_all_lanes = jnp.broadcast_to(l_curr, (bq, NUM_LANES))
         
         # Update running sum with correction factor
-        alpha = jnp.exp(m_prev[:, :1] - m_next)  # [bq, 1]
-        l_next = l_curr + alpha * l_prev[:, :1]  # [bq, 1]
-        l_next_all_lanes = jnp.broadcast_to(l_next, (bq, NUM_LANES))
-        
-        m_scratch_ref[...], l_scratch_ref[...] = m_next_all_lanes, l_next_all_lanes
+        alpha = jnp.exp(m_prev - m_next)  # [bq, 1]
+        l_next = l_curr + alpha * l_prev  # [bq, 1]
         
         # Compute weighted output: s_curr @ V
         v = v_sparse_ref[slice_k, :].astype(float32)  # [bkv_compute, head_dim]
-        o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS)
+        o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS, preferred_element_type=float32)
         
         # Update output accumulator with correction
-        # alpha will broadcast from (bq, NUM_LANES) to (bq, head_dim_v)
+        # OPTIMIZATION: alpha broadcasts directly from (bq, 1) to (bq, head_dim_v)
         o_scratch_ref[:] = alpha * o_scratch_ref[:] + o_curr
+        
+        return (m_next, l_next)  # Pass via carry for next iteration
     
-    # Run the loop over all K/V compute blocks
+    # Run the loop with m, l in carry (stays in registers, not memory!)
     num_iters = bkv_sparse // bkv_compute
-    lax.fori_loop(0, num_iters, body, None, unroll=True)
+    m_init = jnp.full((bq, 1), mask_value, dtype=float32)
+    l_init = jnp.zeros((bq, 1), dtype=float32)
+    m_final, l_final = lax.fori_loop(0, num_iters, body, (m_init, l_init), unroll=True)
+    
+    # Write final statistics to scratch (for consistency, though not strictly needed)
+    m_scratch_ref[...] = jnp.broadcast_to(m_final, (bq, NUM_LANES))
+    l_scratch_ref[...] = jnp.broadcast_to(l_final, (bq, NUM_LANES))
     
     # Final normalization (wrapped in pl.when even though j is always 0)
     @pl.when(j == 0)  # Since grid third dim is 1, j is always 0
