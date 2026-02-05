@@ -328,9 +328,23 @@ def main():
     print("="*80)
     
     # Check device
-    devices = jax.devices()
-    print(f"\nDevices: {devices}")
-    print(f"Backend: {devices[0].platform}")
+    try:
+        devices = jax.devices()
+        print(f"\nDevices: {devices}")
+        print(f"Backend: {devices[0].platform}")
+    except RuntimeError as e:
+        if "TPU is already in use" in str(e):
+            print("\n❌ ERROR: TPU is locked by another process!")
+            print("\nSOLUTION in Colab:")
+            print("1. Go to Runtime → Restart runtime")
+            print("2. Then run this script again")
+            print("\nAlternatively, try:")
+            print("  import os")
+            print("  os.system('sudo lsof -t /dev/accel0 | xargs -r kill -9')")
+            print("  # Then restart runtime")
+            sys.exit(1)
+        else:
+            raise
     
     if devices[0].platform != 'tpu':
         print("\n⚠️  WARNING: Not running on TPU!")

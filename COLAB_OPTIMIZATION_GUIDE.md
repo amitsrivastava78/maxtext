@@ -45,6 +45,38 @@ This will test **5 optimization strategies**:
 
 Expected runtime: **5-10 minutes**
 
+## Common Issues & Fixes
+
+### ❌ Issue: "TPU is already in use by process"
+
+**Error:**
+```
+RuntimeError: The TPU is already in use by process with pid XXXX
+```
+
+**Fix (Recommended):**
+1. Go to **Runtime → Restart runtime** in Colab menu
+2. Re-run from Cell 1 (clone might say "already exists" - that's fine)
+3. Skip Cell 2 if JAX is already installed
+4. Run Cell 4 again
+
+**Alternative Fix:**
+```python
+# In a new cell:
+import os
+os.system('sudo lsof -t /dev/accel0 | xargs -r kill -9 2>/dev/null || true')
+# Then: Runtime → Restart runtime
+```
+
+### ⚠️ Warning: "Transparent hugepages not enabled"
+
+This is just a **warning**, not an error. You can safely **ignore** it.
+
+The script will run fine. If you want to enable it anyway (optional):
+```python
+!sudo sh -c "echo always > /sys/kernel/mm/transparent_hugepage/enabled"
+```
+
 ## What to expect
 
 The script will output:
