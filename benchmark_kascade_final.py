@@ -488,20 +488,27 @@ def main():
     print("   Tokenizing documents...")
     all_tokens = []
     doc_count = 0
+    needed_tokens = 2 * SEQ_LEN  # Need 2x for calibration + test
+    
     for example in dataset:
-        if len(all_tokens) >= 1024:
+        if len(all_tokens) >= needed_tokens:
             break
         
         # Tokenize and take tokens
-        text = example['text'][:2000]  # Limit text length
+        text = example['text'][:10000]  # Increased to 10000 to get more tokens per doc
         tokens = tokenizer.encode(text, add_special_tokens=False)  # No special tokens to avoid mismatch
         all_tokens.extend(tokens)
         doc_count += 1
         
-        if doc_count >= 5:  # Limit to 5 documents to speed up
+        if doc_count >= 20:  # Increased to 20 to ensure we get enough tokens for large seq_len
             break
     
     print(f"   ✓ Collected tokens from {doc_count} documents")
+    
+    # Verify we have enough tokens
+    needed_tokens = 2 * SEQ_LEN
+    if len(all_tokens) < needed_tokens:
+        raise ValueError(f"Not enough tokens collected: {len(all_tokens)} < {needed_tokens}. Increase document count or text length.")
     
     # Trim to exactly 2*SEQ_LEN tokens (half for calibration, half for test)
     all_tokens = all_tokens[:2 * SEQ_LEN]
@@ -515,6 +522,10 @@ def main():
     
     print(f"   ✓ Calibration: {calib_ids.shape[1]} tokens from C4")
     print(f"   ✓ Test: {test_ids.shape[1]} tokens (different documents)")
+    
+    # Verify shapes
+    assert calib_ids.shape[1] == SEQ_LEN, f"Calibration shape mismatch: {calib_ids.shape[1]} != {SEQ_LEN}"
+    assert test_ids.shape[1] == SEQ_LEN, f"Test shape mismatch: {test_ids.shape[1]} != {SEQ_LEN}"
     
     # Calibrate
     schedule = calibrate_on_real_text_optimized(params_dict, calib_ids, args.threshold, args.max_reuse_dist)
