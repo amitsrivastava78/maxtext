@@ -125,39 +125,38 @@ def kascade_attention_kernel(
         assert qk.shape == (bq, bkv_compute)
         
         # Online softmax: update max
-        m_curr = qk.max(axis=-1)[:, None]  # [bq, 1]
+        m_curr = qk.max(axis=-1, keepdims=True)  # [bq, 1]
         assert m_curr.shape == (bq, 1)
-        m_next = jnp.maximum(m_prev, m_curr)
-        assert m_next.shape == (bq, NUM_LANES)
+        m_next = jnp.maximum(m_prev[:, :1], m_curr)  # Use only first lane of m_prev
+        assert m_next.shape == (bq, 1)
         
-        # Compute exp(qk - m_next) and sum
-        # Broadcast m_next from (bq, NUM_LANES) to (bq, bkv_compute)
-        if bkv_compute == NUM_LANES:
-            m_next_broadcast = m_next
-        else:
-            m_next_broadcast = pltpu.repeat(m_next, bkv_repeats, axis=1)
-        s_curr = jnp.exp(qk - m_next_broadcast)
+        # Store in all lanes (for consistency with SplashAttention)
+        m_next_all_lanes = jnp.broadcast_to(m_next, (bq, NUM_LANES))
+        
+        # Compute exp(qk - m_next) and sum  
+        s_curr = jnp.exp(qk - m_next)  # m_next broadcasts from (bq, 1)
         assert s_curr.shape == (bq, bkv_compute)
         
-        l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
-        assert l_curr.shape == (bq, NUM_LANES)
+        l_curr = s_curr.sum(axis=-1, keepdims=True)  # [bq, 1]
+        assert l_curr.shape == (bq, 1)
+        
+        # Broadcast to all lanes
+        l_curr_all_lanes = jnp.broadcast_to(l_curr, (bq, NUM_LANES))
         
         # Update running sum with correction factor
-        alpha = jnp.exp(m_prev - m_next)
-        l_next = l_curr + alpha * l_prev
-        m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
+        alpha = jnp.exp(m_prev[:, :1] - m_next)  # [bq, 1]
+        l_next = l_curr + alpha * l_prev[:, :1]  # [bq, 1]
+        l_next_all_lanes = jnp.broadcast_to(l_next, (bq, NUM_LANES))
+        
+        m_scratch_ref[...], l_scratch_ref[...] = m_next_all_lanes, l_next_all_lanes
         
         # Compute weighted output: s_curr @ V
         v = v_sparse_ref[slice_k, :].astype(float32)  # [bkv_compute, head_dim]
         o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS)
         
         # Update output accumulator with correction
-        # Broadcast alpha from (bq, NUM_LANES) to (bq, head_dim_v)
-        if head_dim_v == NUM_LANES:
-            alpha_o = alpha
-        else:
-            alpha_o = pltpu.repeat(alpha, head_dim_v_repeats, axis=1)
-        o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
+        # alpha will broadcast from (bq, NUM_LANES) to (bq, head_dim_v)
+        o_scratch_ref[:] = alpha * o_scratch_ref[:] + o_curr
     
     # Run the loop over all K/V compute blocks
     num_iters = bkv_sparse // bkv_compute
@@ -165,15 +164,9 @@ def kascade_attention_kernel(
     
     # Final normalization (always run since grid third dim is 1)
     l = l_scratch_ref[...]  # (bq, NUM_LANES) - all lanes should have same value
-    # Take first lane only since all lanes contain the same sum
-    l_single = l[:, :1]  # (bq, 1)
-    # Broadcast to match head_dim_v
-    if head_dim_v == NUM_LANES:
-        l_broadcast = l_single  # Will broadcast (bq, 1) to (bq, 128)
-    else:
-        l_broadcast = jnp.broadcast_to(l_single, (l_single.shape[0], head_dim_v))
-    l_inv = 1.0 / l_broadcast
-    o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
+    # Take first lane only since all lanes contain the same sum, then broadcast
+    l_for_div = l[:, :1]  # (bq, 1) - will broadcast to (bq, head_dim_v)
+    o_ref[...] = (o_scratch_ref[...] / l_for_div).astype(o_ref.dtype)
 
 
 def kascade_attention_forward(
