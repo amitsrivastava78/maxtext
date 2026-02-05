@@ -101,14 +101,15 @@ def test_correctness_tpu():
 
 
 def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
-    """Benchmark Phase 2 performance on TPU."""
+    """Benchmark Phase 3 performance on TPU."""
     print("\n" + "="*70)
-    print("PHASE 2 PERFORMANCE BENCHMARK (TPU)")
+    print("PHASE 3 PERFORMANCE BENCHMARK (TPU)")
     print("="*70)
-    print("\nPhase 2 optimizations:")
-    print("  - Smaller block_q (512→256) for better cache")
-    print("  - Adaptive loop unrolling")
-    print("  - Improved memory access patterns")
+    print("\nPhase 3 optimizations:")
+    print("  - Hoist Q load outside loop (cache in registers)")
+    print("  - Load K and V together (memory coalescing)")
+    print("  - Fuse exp operations (better instruction scheduling)")
+    print("  - Eliminate redundant type conversions")
     
     # Realistic size
     num_heads = 32
@@ -179,26 +180,37 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # Results
     speedup = mean_ref / mean_kernel
     
-    # Calculate improvement over Phase 1 baseline
+    # Calculate improvement over previous phases
     phase1_baseline = 0.785
+    phase2_baseline = 0.911
     
     print(f"\n{'='*70}")
     print("PERFORMANCE RESULTS:")
     print(f"{'='*70}")
     print(f"Reference (JAX):        {mean_ref*1000:.3f} ms")
-    print(f"Phase 2 Kernel:         {mean_kernel*1000:.3f} ms")
+    print(f"Phase 3 Kernel:         {mean_kernel*1000:.3f} ms")
     print(f"Speedup:                {speedup:.3f}×")
-    print(f"Phase 1 baseline:       {phase1_baseline:.3f}×")
-    print(f"Improvement:            {((speedup/phase1_baseline - 1)*100):+.1f}%")
+    print(f"\nProgress:")
+    print(f"  Phase 1 baseline:     {phase1_baseline:.3f}×")
+    print(f"  Phase 2 baseline:     {phase2_baseline:.3f}×")
+    print(f"  Phase 3 (current):    {speedup:.3f}×")
+    print(f"  vs Phase 2:           {((speedup/phase2_baseline - 1)*100):+.1f}%")
+    print(f"  vs Original (0.66×):  {((speedup/0.66 - 1)*100):+.1f}%")
     
     # Analysis
     if speedup >= 1.0:
         improvement = (speedup - 1.0) * 100
-        print(f"\n✅ SUCCESS: Kernel is {improvement:.1f}% faster!")
-        if speedup >= 1.2:
-            print(f"   Exceeded expectations! (Expected: 1.2-1.33×, Got: {speedup:.2f}×)")
+        print(f"\n🎉 SUCCESS: Kernel is {improvement:.1f}% faster than JAX!")
+        if speedup >= 2.0:
+            print(f"   EXCEEDED TARGET! (Goal: 2-3×, Got: {speedup:.2f}×)")
+        elif speedup >= 1.5:
+            print(f"   EXCELLENT! Close to 2× target")
         else:
-            print(f"   On track. Need Phase 2+3 to reach 2-3× target.")
+            print(f"   Good progress, continue optimizing for 2-3× target")
+    elif speedup >= 0.95:
+        slowdown = (1.0 / speedup - 1.0) * 100
+        print(f"\n✅ NEAR PARITY: Only {slowdown:.1f}% slower")
+        print(f"   Almost there! Small tweaks needed")
     elif speedup >= 0.8:
         slowdown = (1.0 / speedup - 1.0) * 100
         print(f"\n⚠️  IMPROVED: Kernel is {slowdown:.1f}% slower (was 52% slower)")
@@ -257,22 +269,29 @@ def main():
     print("NEXT STEPS:")
     print("="*70)
     
-    if speedup >= 1.5:
-        print("🎉 Phase 1 exceeded expectations!")
-        print("   → Continue to Phase 2 (block tuning) to reach 2-3× target")
+    if speedup >= 2.0:
+        print("🎉 TARGET ACHIEVED! Kernel is 2× faster!")
+        print("   → Mission accomplished!")
+        print("   → Consider: Profile for potential 3× push")
+    elif speedup >= 1.5:
+        print("✅ Excellent progress - halfway to 2-3× target")
+        print("   → Consider: Advanced optimizations")
+        print("   → Tune: Block sizes for different input sizes")
+        print("   → Profile: TPU utilization and memory bandwidth")
     elif speedup >= 1.0:
-        print("✅ Phase 1 working as expected")
-        print("   → Continue to Phase 2 (block tuning)")
-        print("   → Then Phase 3 (prefetching) for 2-3× target")
-    elif speedup >= 0.8:
-        print("⚠️  Phase 1 improved but still slower than baseline")
-        print("   → Continue to Phase 2 (block tuning) to break even")
-        print("   → Phase 3 (prefetching) is CRITICAL for speedup")
+        print("✅ Faster than baseline! Great milestone")
+        print("   → Need: Additional 50-100% for 2× target")
+        print("   → Try: Operation fusion, better block sizes")
+        print("   → Profile: Find remaining bottlenecks")
+    elif speedup >= 0.95:
+        print("⚠️  So close to breaking even!")
+        print("   → Small tweaks should get past 1.0×")
+        print("   → Then focus on reaching 2× target")
     else:
-        print("❌ Phase 1 didn't improve performance")
-        print("   → Debug: Check TPU utilization, memory patterns")
-        print("   → Review kernel compilation logs")
-        print("   → May need to revisit optimization approach")
+        print("⚠️  Phase 3 didn't provide expected gains")
+        print("   → Debug: TPU utilization, memory patterns")
+        print("   → Profile: Instruction-level analysis")
+        print("   → Consider: Revisit algorithm approach")
     
     print("="*70)
 

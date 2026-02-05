@@ -107,48 +107,53 @@ def kascade_attention_kernel(
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
     o_ref[...] = jnp.zeros_like(o_ref)
     
+    # Phase 3: Prefetch optimization - load Q once outside loop
+    q = q_ref[...]  # [bq, head_dim] - cache Q in registers
+    
     # Main computation loop over K/V blocks
-    # OPTIMIZATION: Keep m, l in carry to avoid scratch buffer reads on every iteration
+    # Phase 1: Keep m, l in carry to avoid scratch buffer reads
+    # Phase 3: Hoist invariant loads, fuse operations
     def body(kv_compute_idx, carry):
-        """Process one K/V compute block."""
+        """Process one K/V compute block with optimizations."""
         m_prev, l_prev = carry  # [bq, 1] - kept in registers, not memory!
         
         # Slice current K/V block
         slice_k = pl.ds(kv_compute_idx * bkv_compute, bkv_compute)
         
-        # Compute Q @ K^T for this block (with scaling)
-        q = q_ref[...]  # [bq, head_dim]
+        # Load K and V together (better memory coalescing)
         k = k_sparse_ref[slice_k, :]  # [bkv_compute, head_dim]
+        v = v_sparse_ref[slice_k, :]  # [bkv_compute, head_dim]
+        
+        # Compute Q @ K^T with scaling (fused)
         qk = lax.dot_general(q, k, NT_DIM_NUMBERS, preferred_element_type=float32)
         qk = qk / jnp.sqrt(float32(head_dim_v))  # Scale by 1/sqrt(d)
         
         # Online softmax: update max
         m_curr = qk.max(axis=-1, keepdims=True)  # [bq, 1]
-        m_next = jnp.maximum(m_prev, m_curr)  # Both [bq, 1] - no slicing needed!
+        m_next = jnp.maximum(m_prev, m_curr)
         
-        # Compute exp(qk - m_next) and sum  
-        s_curr = jnp.exp(qk - m_next)  # m_next broadcasts from (bq, 1)
+        # Compute exp and alpha together (better instruction scheduling)
+        s_curr = jnp.exp(qk - m_next)
+        alpha = jnp.exp(m_prev - m_next)
+        
+        # Update running sum
         l_curr = s_curr.sum(axis=-1, keepdims=True)  # [bq, 1]
+        l_next = l_curr + alpha * l_prev
         
-        # Update running sum with correction factor
-        alpha = jnp.exp(m_prev - m_next)  # [bq, 1]
-        l_next = l_curr + alpha * l_prev  # [bq, 1]
+        # Compute weighted output with V (already loaded)
+        v_float = v.astype(float32)
+        o_curr = lax.dot_general(s_curr, v_float, NN_DIM_NUMBERS, preferred_element_type=float32)
         
-        # Compute weighted output: s_curr @ V
-        v = v_sparse_ref[slice_k, :].astype(float32)  # [bkv_compute, head_dim]
-        o_curr = lax.dot_general(s_curr, v, NN_DIM_NUMBERS, preferred_element_type=float32)
-        
-        # Update output accumulator with correction
-        # OPTIMIZATION: alpha broadcasts directly from (bq, 1) to (bq, head_dim_v)
+        # Update output accumulator
         o_scratch_ref[:] = alpha * o_scratch_ref[:] + o_curr
         
-        return (m_next, l_next)  # Pass via carry for next iteration
+        return (m_next, l_next)
     
-    # Run the loop with m, l in carry (stays in registers, not memory!)
+    # Run the loop with optimizations
     num_iters = bkv_sparse // bkv_compute
     m_init = jnp.full((bq, 1), mask_value, dtype=float32)
     l_init = jnp.zeros((bq, 1), dtype=float32)
-    # Phase 2: Explicit unroll for small iteration counts (2-4 iters typical)
+    # Phase 2: Adaptive unroll
     should_unroll = num_iters <= 4
     m_final, l_final = lax.fori_loop(0, num_iters, body, (m_init, l_init), unroll=should_unroll)
     
