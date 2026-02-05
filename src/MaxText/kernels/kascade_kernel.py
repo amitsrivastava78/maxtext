@@ -70,7 +70,6 @@ def kascade_attention_kernel(
     bkv_sparse: int,
     bkv_compute: int,
     head_dim_v: int,
-    grid_width: int,
 ):
     """
     Kascade attention kernel for one Q block × sparse K/V.
@@ -101,12 +100,10 @@ def kascade_attention_kernel(
     if rem != 0:
         raise NotImplementedError(f"{bkv_compute=} should be a multiple of {NUM_LANES}")
     
-    # Initialize accumulators at start of sequence
-    @pl.when(j == 0)
-    def init():
-        o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-        m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
-        l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    # Initialize accumulators (always run since grid third dim is 1)
+    o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
+    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
     
     # Main computation loop over K/V blocks
     def body(kv_compute_idx, _):
@@ -156,16 +153,10 @@ def kascade_attention_kernel(
     num_iters = bkv_sparse // bkv_compute
     lax.fori_loop(0, num_iters, body, None, unroll=True)
     
-    # Final normalization at end of sequence
-    @pl.when(j == grid_width - 1)
-    def end():
-        l = l_scratch_ref[...]
-        l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
-        o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
-        
-        m_scratch_ref[...] = jnp.zeros_like(m_scratch_ref)
-        l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-        o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+    # Final normalization (always run since grid third dim is 1)
+    l = l_scratch_ref[...]
+    l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
+    o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
 
 
 def kascade_attention_forward(
@@ -226,7 +217,6 @@ def kascade_attention_forward(
     # Grid: (num_heads, num_q_blocks, 1)
     num_q_blocks = (q_seq_len + bq - 1) // bq
     grid = (num_heads, num_q_blocks, 1)
-    grid_width = 1  # Simple linear scan (no shrinking like SplashAttention)
     
     # Index maps for Pallas
     def q_index_map(h, i, j):
@@ -265,7 +255,6 @@ def kascade_attention_forward(
         bkv_sparse=bkv_sparse,
         bkv_compute=bkv_compute,
         head_dim_v=head_dim_v,
-        grid_width=grid_width,
     )
     
     # Call Pallas (no special compiler_params needed for TPU)
