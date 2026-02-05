@@ -503,15 +503,15 @@ def main():
     
     print(f"   ✓ Collected tokens from {doc_count} documents")
     
-    # Trim to exactly 1024 tokens
-    all_tokens = all_tokens[:1024]
+    # Trim to exactly 2*SEQ_LEN tokens (half for calibration, half for test)
+    all_tokens = all_tokens[:2 * SEQ_LEN]
     
     # Ensure we have valid token IDs (clip to vocab size)
     all_tokens = [min(t, VOCAB_SIZE - 1) for t in all_tokens]
     
-    # Split into calibration (first 512) and test (next 512)
-    calib_ids = jnp.array([all_tokens[:512]], dtype=jnp.int32)
-    test_ids = jnp.array([all_tokens[512:1024]], dtype=jnp.int32)
+    # Split into calibration (first SEQ_LEN) and test (next SEQ_LEN)
+    calib_ids = jnp.array([all_tokens[:SEQ_LEN]], dtype=jnp.int32)
+    test_ids = jnp.array([all_tokens[SEQ_LEN:2*SEQ_LEN]], dtype=jnp.int32)
     
     print(f"   ✓ Calibration: {calib_ids.shape[1]} tokens from C4")
     print(f"   ✓ Test: {test_ids.shape[1]} tokens (different documents)")
