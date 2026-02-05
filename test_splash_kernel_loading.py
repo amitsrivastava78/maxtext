@@ -64,10 +64,13 @@ except Exception as e:
 # Test 3: Import Kascade layers and test with splash
 print(f"\n🔧 Test 3: Testing KascadeAnchorAttention with use_splash=True...")
 try:
-    # Import Kascade layers
-    sys.path.insert(0, src_path)
-    from MaxText.layers.kascade_layers import KascadeAnchorAttention
+    # Import Kascade layers directly without triggering MaxText __init__.py
+    kascade_spec = importlib.util.spec_from_file_location("kascade_layers", kascade_path)
+    kascade_module = importlib.util.module_from_spec(kascade_spec)
+    sys.modules[kascade_spec.name] = kascade_module
+    kascade_spec.loader.exec_module(kascade_module)
     
+    KascadeAnchorAttention = kascade_module.KascadeAnchorAttention
     print(f"   ✓ KascadeAnchorAttention imported")
     
     # Test that use_splash parameter is accepted
