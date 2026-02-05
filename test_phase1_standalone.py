@@ -135,9 +135,15 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # JIT compile both
     ref_fn = jax.jit(reference_attention_sparse)
     
-    # Use kernel defaults (Phase 2: block_q=256, block_kv_sparse=256, block_kv_compute=128)
-    # Note: Passing explicit block_sizes vs using defaults may affect XLA optimization
-    block_sizes = None  # Let kernel use its optimized defaults
+    # Phase 2 block sizes - using explicit values per kernel defaults
+    # NOTE: Current results show ~0.72-0.77× which doesn't match claimed 0.911×
+    # This suggests either: different input sizes, different TPU config, or 
+    # the 0.911× result was from a different test entirely
+    block_sizes = KascadeBlockSizes(
+        block_q=256,
+        block_kv_sparse=256,
+        block_kv_compute=128
+    )
     
     @jax.jit
     def kernel_fn(q, k, v):
