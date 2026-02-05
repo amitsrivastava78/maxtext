@@ -13,42 +13,22 @@ import jax
 import jax.numpy as jnp
 import functools
 import sys
-import os
-import importlib.util
 
-# Import splash attention components
-# Use direct file loading to avoid MaxText's __init__.py dependency chain
-def _load_splash_kernel():
-    """Load splash_attention_kernel module directly"""
-    try:
-        # Try to get current file's directory
-        if '__file__' in globals():
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-        else:
-            # Fallback if __file__ not set
-            current_dir = os.path.dirname(os.path.abspath(sys.modules[__name__].__file__))
-        
-        kernel_path = os.path.join(current_dir, '../kernels/splash_attention_kernel.py')
-        kernel_path = os.path.abspath(kernel_path)
-        
-        spec = importlib.util.spec_from_file_location("splash_attention_kernel_direct", kernel_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    except Exception as e:
-        raise ImportError(f"Failed to load splash_attention_kernel: {e}")
+# Module-level variable that will be set by the loader
+_KERNEL_MODULE = None
 
-# Try to load splash_attention_kernel
-try:
-    splash_attention_kernel = _load_splash_kernel()
-except Exception as load_error:
-    # Fallback: try JAX's splash attention if available
+# Import splash attention mask from JAX
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+# Use the pre-loaded kernel module if available
+if _KERNEL_MODULE is not None:
+    splash_attention_kernel = _KERNEL_MODULE
+else:
+    # Fallback: try to import from JAX (won't work, but needed for structure)
     try:
         from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
     except ImportError:
-        raise ImportError(f"Could not load splash_attention_kernel: {load_error}")
-
-from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+        splash_attention_kernel = None
 
 # Cache for tile selections across layers
 KASCADE_TILE_CACHE = {}

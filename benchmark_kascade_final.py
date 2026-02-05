@@ -479,15 +479,24 @@ def main():
             args.use_splash_kernel = False
         else:
             try:
-                # Direct import to avoid MaxText's __init__.py dependency chain
+                # Step 1: Load splash_attention_kernel first
                 import importlib.util
+                kernel_path = os.path.join(src_path, "MaxText/kernels/splash_attention_kernel.py")
+                kernel_path = os.path.abspath(kernel_path)
+                
+                kernel_spec = importlib.util.spec_from_file_location("splash_attention_kernel_direct", kernel_path)
+                kernel_module = importlib.util.module_from_spec(kernel_spec)
+                kernel_spec.loader.exec_module(kernel_module)
+                
+                # Step 2: Load kascade_splash_attention and inject the kernel module
                 splash_path = os.path.join(src_path, "MaxText/layers/kascade_splash_attention.py")
                 splash_path = os.path.abspath(splash_path)
                 
                 spec = importlib.util.spec_from_file_location("kascade_splash_attention", splash_path)
                 kascade_splash_module = importlib.util.module_from_spec(spec)
                 
-                # Set __file__ before executing to help with relative imports
+                # Inject the kernel module before execution
+                kascade_splash_module._KERNEL_MODULE = kernel_module
                 kascade_splash_module.__file__ = splash_path
                 
                 spec.loader.exec_module(kascade_splash_module)
