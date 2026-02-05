@@ -164,12 +164,15 @@ def kascade_attention_kernel(
     lax.fori_loop(0, num_iters, body, None, unroll=True)
     
     # Final normalization (always run since grid third dim is 1)
-    l = l_scratch_ref[...]
-    # Broadcast l_inv from (bq, NUM_LANES) to (bq, head_dim_v)
+    l = l_scratch_ref[...]  # (bq, NUM_LANES) - all lanes should have same value
+    # Take first lane only since all lanes contain the same sum
+    l_single = l[:, :1]  # (bq, 1)
+    # Broadcast to match head_dim_v
     if head_dim_v == NUM_LANES:
-        l_inv = 1.0 / l
+        l_broadcast = l_single  # Will broadcast (bq, 1) to (bq, 128)
     else:
-        l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=1)
+        l_broadcast = jnp.broadcast_to(l_single, (l_single.shape[0], head_dim_v))
+    l_inv = 1.0 / l_broadcast
     o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
 
 
