@@ -58,10 +58,11 @@ def kascade_attention_kernel(
     q_ref,  # [block_q, head_dim]
     k_sparse_ref,  # [block_kv_sparse, head_dim]
     v_sparse_ref,  # [block_kv_sparse, head_dim]
-    # Outputs
-    m_scratch_ref,  # [block_q, NUM_LANES] - max logits (for online softmax)
-    l_scratch_ref,  # [block_q, NUM_LANES] - sum of exp (for online softmax)
-    o_scratch_ref,  # [block_q, head_dim] - output accumulator
+    # Scratch buffers (MUST match scratch_shapes order!)
+    m_scratch_ref,  # [block_q, NUM_LANES] - max logits (scratch_shapes[0])
+    l_scratch_ref,  # [block_q, NUM_LANES] - sum of exp (scratch_shapes[1])
+    o_scratch_ref,  # [block_q, head_dim] - output accumulator (scratch_shapes[2])
+    # Output
     o_ref,  # [block_q, head_dim] - final output
     # Parameters
     *,
@@ -104,6 +105,7 @@ def kascade_attention_kernel(
     o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
     m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
     l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    o_ref[...] = jnp.zeros_like(o_ref)  # Also initialize output buffer
     
     # Main computation loop over K/V blocks
     def body(kv_compute_idx, _):
