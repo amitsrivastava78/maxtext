@@ -16,9 +16,8 @@
 ```
 
 ```python
-# In Colab cell 2: Install dependencies
-!pip install -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-!pip install -q jaxlib
+# In Colab cell 2: Install dependencies (IMPORTANT: Get latest versions!)
+!pip install -U -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 ```
 
 ```python
