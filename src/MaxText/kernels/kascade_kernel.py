@@ -162,11 +162,12 @@ def kascade_attention_kernel(
     num_iters = bkv_sparse // bkv_compute
     lax.fori_loop(0, num_iters, body, None, unroll=True)
     
-    # Final normalization (always run since grid third dim is 1)
-    l = l_scratch_ref[...]  # (bq, NUM_LANES) - all lanes should have same value
-    # Take first lane only since all lanes contain the same sum, then broadcast
-    l_for_div = l[:, :1]  # (bq, 1) - will broadcast to (bq, head_dim_v)
-    o_ref[...] = (o_scratch_ref[...] / l_for_div).astype(o_ref.dtype)
+    # Final normalization (wrapped in pl.when even though j is always 0)
+    @pl.when(j == 0)  # Since grid third dim is 1, j is always 0
+    def end():
+        l = l_scratch_ref[...]  # (bq, NUM_LANES)
+        # Normalize output
+        o_ref[...] = (o_scratch_ref[...] / l).astype(o_ref.dtype)
 
 
 def kascade_attention_forward(
