@@ -141,8 +141,11 @@ class KascadeAnchorAttention(nn.Module):
         tile_scores = jnp.max(tiled_probs, axis=-1) 
         
         # E. Extract Top-K Indices
+        # Cap top_k by actual number of tiles (avoid error when tiles < top_k)
+        num_tiles = tile_scores.shape[-1]
+        actual_top_k = min(self.top_k_tiles, num_tiles)
         # Shape: [Batch, Heads, Top_K]
-        _, top_tile_indices = jax.lax.top_k(tile_scores, self.top_k_tiles)
+        _, top_tile_indices = jax.lax.top_k(tile_scores, actual_top_k)
         
         # F. Save to Cache (For Calibration or Reuse)
         cache_key = f"layer_{self.layer_id}_indices"
@@ -151,7 +154,7 @@ class KascadeAnchorAttention(nn.Module):
         # Debug Visualization
         if DEBUG_MODE:
             def print_anchor(idx):
-                print(f"  [Anchor L{self.layer_id}] Selected Top-{self.top_k_tiles} Tiles (Head 0): {idx[0,0]}")
+                print(f"  [Anchor L{self.layer_id}] Selected Top-{actual_top_k} Tiles (Head 0): {idx[0,0]}")
             jax.debug.callback(print_anchor, top_tile_indices)
         
         # Finish Layer
