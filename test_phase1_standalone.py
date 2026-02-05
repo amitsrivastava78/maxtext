@@ -104,9 +104,9 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     print("="*70)
     print("\nOptimizations applied:")
     print("  - Phase 1: Carry-based m/l updates (avoid scratch reads)")
-    print("  - Optimized block sizes (block_q=512, based on diagnostics)")
+    print("  - Optimized block sizes (block_q=1024, based on diagnostics)")
     print("  - Adaptive loop unrolling")
-    print("\nNote: Diagnostic revealed block_q=512 is 18% faster than 256")
+    print("\nNote: Diagnostic revealed block_q=1024 achieves 0.97× (near parity!)")
     
     # Realistic size
     num_heads = 32
@@ -132,9 +132,9 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # JIT compile both
     ref_fn = jax.jit(reference_attention_sparse)
     
-    # Use kernel defaults (block_q=512 after diagnostic optimization)
+    # Use kernel defaults (block_q=1024 for near-parity performance)
     # Diagnostic showed: 256→0.72×, 512→0.85×, 1024→0.97×
-    block_sizes = None  # Uses: block_q=512, block_kv_sparse=256, block_kv_compute=128
+    block_sizes = None  # Uses: block_q=1024, block_kv_sparse=256, block_kv_compute=128
     
     @jax.jit
     def kernel_fn(q, k, v):

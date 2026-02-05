@@ -45,10 +45,10 @@ class KascadeBlockSizes(NamedTuple):
         block_kv_compute: K/V compute block size (must divide block_kv_sparse)
     
     Optimized block sizes based on empirical TPU testing:
-    - Larger block_q (512-1024) significantly improves performance
-    - Small blocks (256) cause 30% slowdown due to excessive kernel launches
+    - Larger block_q significantly improves performance (see debug_performance.py)
+    - Diagnostic results: 256→0.72×, 512→0.85×, 1024→0.97×
     """
-    block_q: int = 512  # Empirically optimal: 0.850× vs 0.723× with 256
+    block_q: int = 1024  # Empirically optimal: 0.97× (only 3% slower than JAX!)
     block_kv_sparse: int = 256  # Sparse K/V length is much smaller
     block_kv_compute: int | None = 128  # Good for small K/V blocks
     
