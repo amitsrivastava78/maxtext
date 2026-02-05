@@ -548,7 +548,6 @@ def main():
     print("\n📝 Loading Real C4 Dataset...")
     from datasets import load_dataset
     from transformers import AutoTokenizer
-    import os
     
     # Check for HuggingFace authentication token
     hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
