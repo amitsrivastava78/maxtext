@@ -96,12 +96,11 @@ def kascade_attention_kernel(
     # Get grid indices (same as SplashAttention)
     h, i, j = pl.program_id(0), pl.program_id(1), pl.program_id(2)
     
-    # Validate head_dim_v is multiple of NUM_LANES (same as SplashAttention requirement)
-    head_dim_v_repeats, rem = divmod(head_dim_v, NUM_LANES)
-    if rem != 0:
-        raise NotImplementedError(f"{head_dim_v=} should be a multiple of {NUM_LANES}")
+    # Note: head_dim_v does NOT need to be a multiple of NUM_LANES
+    # The NUM_LANES constraint only applies to sequence-dimension block sizes
+    # Head dimensions (e.g., 64, 96, 128) are handled by standard dot products
     
-    # Validate bkv_compute is multiple of NUM_LANES
+    # Validate bkv_compute is multiple of NUM_LANES for efficient TPU memory access
     bkv_repeats, rem = divmod(bkv_compute, NUM_LANES)
     if rem != 0:
         raise NotImplementedError(f"{bkv_compute=} should be a multiple of {NUM_LANES}")
