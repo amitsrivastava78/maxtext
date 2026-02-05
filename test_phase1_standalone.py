@@ -63,10 +63,10 @@ def test_correctness_tpu():
     out_ref = reference_attention_sparse(q, k_sparse, v_sparse)
     out_ref.block_until_ready()
     
-    # Compute with Phase 1 optimized kernel
-    print("Computing with Phase 1 optimized kernel...")
+    # Compute with optimized kernel (Phase 2)
+    print("Computing with optimized kernel (Phase 2)...")
     block_sizes = KascadeBlockSizes(
-        block_q=512,
+        block_q=256,  # Phase 2: reduced from 512 for better cache utilization
         block_kv_sparse=128,
         block_kv_compute=128
     )
@@ -135,8 +135,9 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # JIT compile both
     ref_fn = jax.jit(reference_attention_sparse)
     
+    # Phase 2 block sizes (optimized)
     block_sizes = KascadeBlockSizes(
-        block_q=512,
+        block_q=256,  # Phase 2: reduced from 512 for better cache utilization
         block_kv_sparse=256,
         block_kv_compute=128
     )
