@@ -14,13 +14,14 @@ import jax.numpy as jnp
 import functools
 import sys
 import os
+import importlib.util
 
 # Import splash attention components
 # Use direct file loading to avoid MaxText's __init__.py dependency chain
 def _load_splash_kernel():
     """Load splash_attention_kernel module directly"""
-    import importlib.util
-    kernel_path = os.path.join(os.path.dirname(__file__), '../kernels/splash_attention_kernel.py')
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    kernel_path = os.path.join(current_dir, '../kernels/splash_attention_kernel.py')
     spec = importlib.util.spec_from_file_location("splash_attention_kernel_direct", kernel_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
