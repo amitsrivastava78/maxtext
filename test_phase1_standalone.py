@@ -63,13 +63,10 @@ def test_correctness_tpu():
     out_ref = reference_attention_sparse(q, k_sparse, v_sparse)
     out_ref.block_until_ready()
     
-    # Compute with optimized kernel (Phase 2)
-    print("Computing with optimized kernel (Phase 2)...")
-    block_sizes = KascadeBlockSizes(
-        block_q=256,  # Phase 2: reduced from 512 for better cache utilization
-        block_kv_sparse=128,
-        block_kv_compute=128
-    )
+    # Compute with optimized kernel
+    print("Computing with optimized kernel...")
+    # Use kernel defaults (now block_q=512 after diagnostic fix)
+    block_sizes = None
     out_kernel = kascade_attention_forward(q, k_sparse, v_sparse, block_sizes)
     out_kernel.block_until_ready()
     
@@ -107,9 +104,9 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     print("="*70)
     print("\nOptimizations applied:")
     print("  - Phase 1: Carry-based m/l updates (avoid scratch reads)")
-    print("  - Phase 2: Optimized block sizes (block_q=256)")
-    print("  - Phase 2: Adaptive loop unrolling")
-    print("\nNote: Phase 3 attempts regressed performance and were reverted")
+    print("  - Optimized block sizes (block_q=512, based on diagnostics)")
+    print("  - Adaptive loop unrolling")
+    print("\nNote: Diagnostic revealed block_q=512 is 18% faster than 256")
     
     # Realistic size
     num_heads = 32
@@ -135,15 +132,9 @@ def benchmark_phase1_tpu(num_warmup=5, num_runs=20):
     # JIT compile both
     ref_fn = jax.jit(reference_attention_sparse)
     
-    # Phase 2 block sizes - using explicit values per kernel defaults
-    # NOTE: Current results show ~0.72-0.77× which doesn't match claimed 0.911×
-    # This suggests either: different input sizes, different TPU config, or 
-    # the 0.911× result was from a different test entirely
-    block_sizes = KascadeBlockSizes(
-        block_q=256,
-        block_kv_sparse=256,
-        block_kv_compute=128
-    )
+    # Use kernel defaults (block_q=512 after diagnostic optimization)
+    # Diagnostic showed: 256→0.72×, 512→0.85×, 1024→0.97×
+    block_sizes = None  # Uses: block_q=512, block_kv_sparse=256, block_kv_compute=128
     
     @jax.jit
     def kernel_fn(q, k, v):
