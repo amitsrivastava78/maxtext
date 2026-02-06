@@ -76,8 +76,8 @@ def apply_rope(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray):
     xq_out = jnp.stack([xq_rotated.real, xq_rotated.imag], axis=-1).reshape(xq.shape)
     xk_out = jnp.stack([xk_rotated.real, xk_rotated.imag], axis=-1).reshape(xk.shape)
     
-    # Return in float32 to match input dtype and avoid precision issues
-    return xq_out, xk_out
+    # TPU-friendly: use bfloat16 instead of float16
+    return xq_out.astype(jnp.bfloat16), xk_out.astype(jnp.bfloat16)
 
 class KascadeAnchorAttention(nn.Module):
     """
