@@ -257,57 +257,100 @@ class KascadeAnchorAttention(nn.Module):
                 return output
         
         # Standard JAX implementation (fallback or when splash disabled)
-        # Calculate Scores: (Q @ K) / sqrt(d)
-        logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(self.head_dim)
-        if mask is None: mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        logits = jnp.where(mask[None, None, :, :], logits, -1e10)
-        weights = jax.nn.softmax(logits, axis=-1)
+        # ============================================================
+        # ATTENTION-BASED TILE SELECTION (memory-efficient)
+        # ============================================================
+        # Use representative queries (last in each tile-group) to score tiles
+        # via real attention weights. Memory: O(num_q_tiles × S) not O(Q × S).
+        # Then tile-group sparse attention for output.
         
-        # --- REQUIREMENT 3: PER-QUERY TILE POOLING & TOP-K (Paper Algorithm) ---
-        # The paper selects top-k tiles PER QUERY POSITION, not just for the last token.
-        # Each query q_i picks its own most important tiles based on its attention weights.
-        
-        # A. Use ALL query positions' attention weights
-        # weights shape: [Batch, Heads, Seq_Len(Q), Seq_Len(K)]
-        all_probs = weights
-        
-        # B. Pad K dimension if it doesn't fit tiles perfectly
-        pad_len = (self.tile_size - (seq_len % self.tile_size)) % self.tile_size
-        if pad_len > 0:
-            all_probs = jnp.pad(all_probs, ((0,0), (0,0), (0,0), (0, pad_len)))
-            
-        # C. Reshape K dimension into Tiles
-        # [B, H, Q, K_padded] → [B, H, Q, num_tiles, tile_size]
-        K_padded = all_probs.shape[-1]
-        num_tiles = K_padded // self.tile_size
-        tiled_probs = all_probs.reshape(batch, self.num_heads, seq_len, num_tiles, self.tile_size)
-        
-        # D. Max Pooling: Find the single highest probability in each tile, per query
-        # Shape: [Batch, Heads, Seq_Len, Num_Tiles]
-        tile_scores = jnp.max(tiled_probs, axis=-1) 
-        
-        # E. Extract Top-K Indices per query
-        num_tiles = tile_scores.shape[-1]
+        num_tiles = seq_len // self.tile_size
+        num_q_tiles = num_tiles
         actual_top_k = min(self.top_k_tiles, num_tiles)
-        # Shape: [Batch, Heads, Seq_Len, Top_K] — per-query tile selections!
-        _, top_tile_indices = jax.lax.top_k(tile_scores, actual_top_k)
         
-        # F. Save to Cache
-        # Last-token indices for REUSE layers and calibration: [B, H, top_k]
+        # Transpose to [B, H, S, D]
+        q_bh = jnp.transpose(q, (0, 2, 1, 3))
+        k_bh = jnp.transpose(k, (0, 2, 1, 3))
+        v_bh = jnp.transpose(v, (0, 2, 1, 3))
+        
+        # --- TILE SELECTION using representative queries ---
+        # Last query in each tile-group (most causal context)
+        rep_pos = jnp.arange(self.tile_size - 1, seq_len, self.tile_size)  # [Qg]
+        q_reps = q_bh[:, :, rep_pos, :]  # [B, H, Qg, D]
+        
+        # Representative Q @ K^T: [B, H, Qg, S]
+        # Memory: [1, 32, 256, 4096] = 128MB (vs 2GB for full Q@K^T)
+        rep_logits = jnp.einsum('bhgd,bhsd->bhgs', q_reps, k_bh) / jnp.sqrt(self.head_dim)
+        
+        # Causal mask: rep at pos p can attend to positions ≤ p
+        rep_positions = rep_pos[None, None, :, None]
+        all_positions = jnp.arange(seq_len)[None, None, None, :]
+        rep_logits = jnp.where(all_positions <= rep_positions, rep_logits, -1e10)
+        
+        rep_weights = jax.nn.softmax(rep_logits, axis=-1)  # [B, H, Qg, S]
+        
+        # Tile scoring: max-pool attention weights over tile_size
+        rep_weights_tiled = rep_weights.reshape(
+            batch, self.num_heads, num_q_tiles, num_tiles, self.tile_size)
+        tile_scores = jnp.max(rep_weights_tiled, axis=-1)  # [B, H, Qg, num_tiles]
+        
+        # Top-K per tile-group
+        _, group_tile_indices = jax.lax.top_k(tile_scores, actual_top_k)
+        # [B, H, Qg, top_k]
+        
+        # --- SAVE TO CACHE ---
+        # Expand to per-query shape for REUSE layer compatibility
+        top_tile_indices = jnp.repeat(group_tile_indices, self.tile_size, axis=2)
+        last_token_indices = group_tile_indices[:, :, -1, :]  # [B, H, top_k]
         cache_key = f"layer_{self.layer_id}_indices"
-        last_token_indices = top_tile_indices[:, :, -1, :]  # [B, H, top_k]
-        KASCADE_CACHE[cache_key] = top_tile_indices  # Full per-query for calibration
+        KASCADE_CACHE[cache_key] = top_tile_indices  # [B, H, Q, top_k]
         KASCADE_CACHE[f"layer_{self.layer_id}_indices_calib"] = last_token_indices
         
         if DEBUG_MODE:
             def print_anchor(idx):
-                print(f"  [Anchor L{self.layer_id}] Selected Top-{actual_top_k} Tiles (Head 0): {idx[0,0]}")
-            jax.debug.callback(print_anchor, top_tile_indices)
+                print(f"  [Anchor L{self.layer_id}] Top-{actual_top_k} Tiles (Head 0): {idx[0,0]}")
+            jax.debug.callback(print_anchor, last_token_indices)
         
-        # G. ANCHOR always uses FULL attention for output (paper: scout layer)
-        # The full attention weights were already computed above for tile selection.
-        # Speedup comes from REUSE layers only, not from ANCHOR.
-        output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
+        # --- SPARSE OUTPUT (tile-group gather, no per-query expansion) ---
+        # Expand tile indices to token indices per tile-group
+        offsets = jnp.arange(self.tile_size)[None, None, None, None, :]
+        tile_starts = group_tile_indices[..., None] * self.tile_size
+        token_indices = tile_starts + offsets
+        sparse_len = actual_top_k * self.tile_size
+        group_flat_indices = token_indices.reshape(
+            batch, self.num_heads, num_q_tiles, sparse_len)
+        group_flat_indices = jnp.clip(group_flat_indices, 0, seq_len - 1)
+        
+        # Gather K, V per tile-group (NOT per query)
+        B, H, S, D = k_bh.shape
+        k_flat = k_bh.reshape(B * H, S, D)
+        v_flat = v_bh.reshape(B * H, S, D)
+        gidx = group_flat_indices.reshape(B * H, num_q_tiles, sparse_len)
+        
+        k_group = jax.vmap(lambda kv, idx: kv[idx])(k_flat, gidx)
+        v_group = jax.vmap(lambda kv, idx: kv[idx])(v_flat, gidx)
+        k_group = k_group.reshape(B, H, num_q_tiles, sparse_len, D)
+        v_group = v_group.reshape(B, H, num_q_tiles, sparse_len, D)
+        
+        # Tile-group sparse attention
+        q_grouped = q_bh.reshape(B, H, num_q_tiles, self.tile_size, D)
+        # [B,H,Qg,ts,D] @ [B,H,Qg,SL,D]^T → [B,H,Qg,ts,SL]
+        sparse_logits = jnp.einsum('bhgtd,bhgsd->bhgts', q_grouped, k_group) / jnp.sqrt(self.head_dim)
+        
+        # Causal mask
+        q_pos = jnp.arange(seq_len).reshape(num_q_tiles, self.tile_size)
+        future = group_flat_indices[:, :, :, None, :] > q_pos[None, None, :, :, None]
+        sparse_logits = jnp.where(future, -1e10, sparse_logits)
+        
+        sparse_weights = jax.nn.softmax(sparse_logits, axis=-1)
+        all_masked = jnp.all(future, axis=-1, keepdims=True)
+        sparse_weights = jnp.where(all_masked, 0.0, sparse_weights)
+        sparse_weights = jnp.where(jnp.isnan(sparse_weights), 0.0, sparse_weights)
+        
+        # [B,H,Qg,ts,SL] @ [B,H,Qg,SL,D] → [B,H,Qg,ts,D]
+        output = jnp.einsum('bhgts,bhgsd->bhgtd', sparse_weights, v_group)
+        output = output.reshape(B, H, seq_len, D)
+        output = jnp.transpose(output, (0, 2, 1, 3))
         output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
         
