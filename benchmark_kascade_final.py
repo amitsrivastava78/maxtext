@@ -226,7 +226,14 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
     emb_data = load_embeddings(weights_dir)
     
     # Check dtype of loaded weights
-    print(f"🔍 Weight dtypes: embed_tokens={emb_data['embed_tokens'].dtype}, norm={emb_data['norm'].dtype}")
+    print(f"🔍 Original weight dtypes: embed_tokens={emb_data['embed_tokens'].dtype}, norm={emb_data['norm'].dtype}")
+    
+    # CRITICAL FIX: Convert float16 weights to float32 for TPU stability
+    # Mixed precision (float16 weights × float32 activations) causes 152% degradation on TPU
+    emb_data['embed_tokens'] = emb_data['embed_tokens'].astype(jnp.float32)
+    emb_data['norm'] = emb_data['norm'].astype(jnp.float32)
+    emb_data['lm_head'] = emb_data['lm_head'].astype(jnp.float32)
+    print(f"   ✓ Converted to float32 for TPU stability")
     
     params = {
         'tok_embeddings': {'embedding': emb_data['embed_tokens']},
@@ -238,17 +245,17 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
         layer_weights = load_layer_params(i, weights_dir)
         if i == 0:
             # Print first layer dtypes
-            print(f"   Layer 0 dtypes: q_proj={layer_weights['attention']['q_proj']['kernel'].dtype}, "
-                  f"k_proj={layer_weights['attention']['k_proj']['kernel'].dtype}")
+            print(f"   Layer 0 original dtypes: q_proj={layer_weights['attention']['q_proj']['kernel'].dtype}")
         
-        wq = layer_weights['attention']['q_proj']['kernel']
-        wk = layer_weights['attention']['k_proj']['kernel']
-        wv = layer_weights['attention']['v_proj']['kernel']
-        wo = layer_weights['attention']['o_proj']['kernel']
+        # Convert all layer weights to float32
+        wq = layer_weights['attention']['q_proj']['kernel'].astype(jnp.float32)
+        wk = layer_weights['attention']['k_proj']['kernel'].astype(jnp.float32)
+        wv = layer_weights['attention']['v_proj']['kernel'].astype(jnp.float32)
+        wo = layer_weights['attention']['o_proj']['kernel'].astype(jnp.float32)
         
         params[f'layer_{i}'] = {
-            'attention_norm': {'scale': layer_weights['input_layernorm']['scale']},
-            'ffn_norm': {'scale': layer_weights['post_attention_layernorm']['scale']},
+            'attention_norm': {'scale': layer_weights['input_layernorm']['scale'].astype(jnp.float32)},
+            'ffn_norm': {'scale': layer_weights['post_attention_layernorm']['scale'].astype(jnp.float32)},
             'KascadeAnchorAttention_0': {
                 'Dense_0': {'kernel': wq},
                 'Dense_1': {'kernel': wk},
@@ -261,9 +268,9 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
                 'Dense_2': {'kernel': wv},
                 'Dense_3': {'kernel': wo}
             },
-            'gate_proj': {'kernel': layer_weights['mlp']['gate_proj']['kernel']},
-            'up_proj': {'kernel': layer_weights['mlp']['up_proj']['kernel']},
-            'down_proj': {'kernel': layer_weights['mlp']['down_proj']['kernel']},
+            'gate_proj': {'kernel': layer_weights['mlp']['gate_proj']['kernel'].astype(jnp.float32)},
+            'up_proj': {'kernel': layer_weights['mlp']['up_proj']['kernel'].astype(jnp.float32)},
+            'down_proj': {'kernel': layer_weights['mlp']['down_proj']['kernel'].astype(jnp.float32)},
         }
     
     print(f"✓ Loaded {emb_data['config']['num_hidden_layers']} layers")
