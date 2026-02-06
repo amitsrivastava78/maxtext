@@ -29,6 +29,7 @@ spec.loader.exec_module(kascade_module)
 
 KascadeAnchorAttention = kascade_module.KascadeAnchorAttention
 KascadeReuseAttention = kascade_module.KascadeReuseAttention
+DenseFullAttention = kascade_module.DenseFullAttention
 KASCADE_CACHE = kascade_module.KASCADE_CACHE
 precompute_freqs_cis = kascade_module.precompute_freqs_cis
 apply_rope = kascade_module.apply_rope
@@ -272,6 +273,12 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
         params[f'layer_{i}'] = {
             'attention_norm': {'scale': layer_weights['input_layernorm']['scale'].astype(jnp.float32)},
             'ffn_norm': {'scale': layer_weights['post_attention_layernorm']['scale'].astype(jnp.float32)},
+            'DenseFullAttention_0': {
+                'Dense_0': {'kernel': wq},
+                'Dense_1': {'kernel': wk},
+                'Dense_2': {'kernel': wv},
+                'Dense_3': {'kernel': wo}
+            },
             'KascadeAnchorAttention_0': {
                 'Dense_0': {'kernel': wq},
                 'Dense_1': {'kernel': wk},
@@ -345,14 +352,9 @@ class LlamaBlock(nn.Module):
         
         # Compute attention based on plan type
         if plan["type"] == "DENSE":
-            # Use ANCHOR attention with full tile set (top_k = total tiles)
-            # This ensures exact same computation as ANCHOR but without sparsity
-            num_tiles = seq_len // TILE_SIZE
-            attn = KascadeAnchorAttention(
-                NUM_HEADS, HEAD_DIM, self.layer_id,
-                top_k_tiles=num_tiles,  # Use ALL tiles = full attention
-                tile_size=TILE_SIZE,
-                use_splash=False  # Never use kernel for baseline
+            # Clean full attention — no tile overhead for fair baseline
+            attn = DenseFullAttention(
+                NUM_HEADS, HEAD_DIM,
             )
             attn_out = attn(normed, freq_cis=freq_cis)
         elif plan["type"] == "ANCHOR":
@@ -611,8 +613,7 @@ def main():
         "allenai/c4", 
         "en", 
         split="validation", 
-        streaming=True,
-        trust_remote_code=True
+        streaming=True
     )
     
     # Collect tokens from multiple different documents
@@ -702,28 +703,14 @@ def main():
     print(f"   Sparse schedule L2: {schedule[2]}")
     model_sparse = LlamaModel(schedule=schedule, use_splash=args.use_splash_kernel)
     
-    # CRITICAL: Must clear cache from Dense baseline before running Sparse!
-    # Dense baseline populated cache with ALL tiles (top_k=32), but Sparse needs
-    # to populate with its own sparse tiles (top_k=12)
-    print(f"   Cache before clear: {list(KASCADE_CACHE.keys())}")
+    # Clear cache from Dense baseline before running Sparse
     KASCADE_CACHE.clear()
-    print(f"   Cache after clear: {list(KASCADE_CACHE.keys())}")
     
-    # First pass: Run model to populate cache (ANCHOR layers will cache their tiles)
-    print("   [Pass 1/2] Populating cache with sparse ANCHOR tiles...")
-    _ = model_sparse.apply(params_dict, test_ids)
-    sparse_calib = KASCADE_CACHE.get('layer_1_indices_calib', KASCADE_CACHE.get('layer_1_indices'))
-    if sparse_calib is not None and sparse_calib.ndim == 3:
-        print(f"   Sparse L1 tiles (head 0, last token): {sparse_calib[0,0]}")
-    elif sparse_calib is not None:
-        print(f"   Sparse L1 tiles (head 0, last token): {sparse_calib[0,0,-1]}")
-    print(f"   Cache after pass 1: {[k for k in KASCADE_CACHE.keys() if not k.endswith('_calib')]}")
-    
-    # Second pass: Now REUSE layers can use the cached tiles from ANCHOR layers
-    # (Cache is NOT cleared between passes - this is intentional!)
-    print("   [Pass 2/2] Computing logits with cached tiles...")
+    # Single pass: ANCHOR layers populate cache before REUSE layers within same fwd pass
+    print("   Running single-pass sparse forward...")
     logits_sparse = model_sparse.apply(params_dict, test_ids)
-    print(f"   Cache after pass 2: {list(KASCADE_CACHE.keys())}")
+    anchor_keys = [k for k in KASCADE_CACHE.keys() if not k.endswith('_calib')]
+    print(f"   Cache populated: {anchor_keys}")
     ppl_sparse = calculate_full_sequence_perplexity(logits_sparse, test_ids)
     
     # Results
@@ -755,44 +742,76 @@ def main():
     
     print(f"\nBenchmarking {n_runs} runs each...")
     
-    # Warmup
+    # Warmup (2 runs each to stabilize JIT)
     print("  Warming up...")
+    KASCADE_CACHE.clear()
     _ = model_dense.apply(params_dict, test_ids)
+    jax.block_until_ready(_)
+    KASCADE_CACHE.clear()
     _ = model_sparse.apply(params_dict, test_ids)
+    jax.block_until_ready(_)
+    KASCADE_CACHE.clear()
+    _ = model_dense.apply(params_dict, test_ids)
+    jax.block_until_ready(_)
+    KASCADE_CACHE.clear()
+    _ = model_sparse.apply(params_dict, test_ids)
+    jax.block_until_ready(_)
     
     # Dense timing
     print("  Timing Dense...")
     dense_times = []
     for i in range(n_runs):
         KASCADE_CACHE.clear()
-        start = time.time()
-        _ = model_dense.apply(params_dict, test_ids)
-        dense_times.append(time.time() - start)
+        start = time.perf_counter()
+        out = model_dense.apply(params_dict, test_ids)
+        jax.block_until_ready(out)
+        dense_times.append(time.perf_counter() - start)
     
     # Sparse timing
     print("  Timing Sparse...")
     sparse_times = []
     for i in range(n_runs):
         KASCADE_CACHE.clear()
-        start = time.time()
-        _ = model_sparse.apply(params_dict, test_ids)
-        sparse_times.append(time.time() - start)
+        start = time.perf_counter()
+        out = model_sparse.apply(params_dict, test_ids)
+        jax.block_until_ready(out)
+        sparse_times.append(time.perf_counter() - start)
     
     dense_avg = sum(dense_times) / len(dense_times) * 1000
     sparse_avg = sum(sparse_times) / len(sparse_times) * 1000
     speedup = dense_avg / sparse_avg if sparse_avg > 0 else 0
     
+    dense_min = min(dense_times) * 1000
+    sparse_min = min(sparse_times) * 1000
+    speedup_best = dense_min / sparse_min if sparse_min > 0 else 0
+    
     print(f"\n📊 Timing Results (avg of {n_runs} runs):")
-    print(f"   Dense:   {dense_avg:.2f} ms")
-    print(f"   Sparse:  {sparse_avg:.2f} ms")
-    print(f"   Speedup: {speedup:.2f}x")
+    print(f"   Dense:   {dense_avg:.1f} ms  (best: {dense_min:.1f} ms)")
+    print(f"   Sparse:  {sparse_avg:.1f} ms  (best: {sparse_min:.1f} ms)")
+    print(f"   Speedup: {speedup:.2f}x avg, {speedup_best:.2f}x best")
+    
+    # Analysis
+    num_tiles = SEQ_LEN // TILE_SIZE
+    attn_fraction = (SEQ_LEN * SEQ_LEN) / (SEQ_LEN * SEQ_LEN + 3 * SEQ_LEN * EMBED_DIM + 3 * SEQ_LEN * MLP_DIM)
+    reuse_frac = reuse_count / NUM_LAYERS
+    sparse_ratio = TOP_K_OPTIMIZED / num_tiles
+    theoretical_attn_speedup = 1.0 / (1 - reuse_frac + reuse_frac * sparse_ratio)
+    theoretical_total_speedup = 1.0 / (1 - attn_fraction + attn_fraction / theoretical_attn_speedup)
+    
+    print(f"\n📐 Analysis:")
+    print(f"   Tiles: {num_tiles}, Top-K: {TOP_K_OPTIMIZED} ({sparse_ratio:.0%} of tiles)")
+    print(f"   REUSE layers: {reuse_count}/{NUM_LAYERS} ({reuse_frac:.0%})")
+    print(f"   Attention fraction of total FLOPs: {attn_fraction:.1%}")
+    print(f"   Theoretical attention-only speedup: {theoretical_attn_speedup:.2f}x")
+    print(f"   Theoretical total speedup: {theoretical_total_speedup:.2f}x")
+    print(f"   (4x attention speedup needs longer sequences where O(n²) dominates)")
     
     if speedup > 1.2:
         print(f"\n✅ Sparse is {speedup:.2f}x faster!")
     elif speedup > 0.8:
-        print(f"\n⚠️  Speedup: {speedup:.2f}x (CPU has overhead, expect better on TPU)")
+        print(f"\n⚠️  Speedup: {speedup:.2f}x (CPU has gather overhead, expect better on TPU)")
     else:
-        print(f"\n⚠️  Sparse slower ({speedup:.2f}x) - normal on CPU due to overhead")
+        print(f"\n⚠️  Sparse slower ({speedup:.2f}x) — normal on CPU due to gather overhead")
     
     print("\n" + "=" * 70)
 
