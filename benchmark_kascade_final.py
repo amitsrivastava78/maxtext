@@ -609,30 +609,30 @@ def main():
     print("   Tokenizing documents...")
     all_tokens = []
     doc_count = 0
-    needed_tokens = 2 * SEQ_LEN  # Need 2x for calibration + test
+    needed_tokens = 2 * SEQ_LEN + SEQ_LEN  # Need enough for calibration + skip + test
     
     for example in dataset:
         if len(all_tokens) >= needed_tokens:
             break
         
         # Tokenize and take tokens
-        text = example['text'][:10000]  # Increased to 10000 to get more tokens per doc
+        text = example['text'][:50000]  # Large limit to get more tokens per doc
         tokens = tokenizer.encode(text, add_special_tokens=False)  # No special tokens to avoid mismatch
         all_tokens.extend(tokens)
         doc_count += 1
         
-        if doc_count >= 20:  # Increased to 20 to ensure we get enough tokens for large seq_len
+        if doc_count >= 100:  # High limit to ensure enough tokens for any seq_len
             break
     
     print(f"   ✓ Collected tokens from {doc_count} documents")
     
     # Verify we have enough tokens
-    needed_tokens = 2 * SEQ_LEN + SEQ_LEN // 2  # Extra for skip buffer
+    needed_tokens = 2 * SEQ_LEN + SEQ_LEN  # calib + skip + test
     if len(all_tokens) < needed_tokens:
         raise ValueError(f"Not enough tokens collected: {len(all_tokens)} < {needed_tokens}. Increase document count or text length.")
     
     # Trim to exactly what we need
-    needed_total = 2 * SEQ_LEN + SEQ_LEN // 2
+    needed_total = 2 * SEQ_LEN + SEQ_LEN
     all_tokens = all_tokens[:needed_total]
     
     # Ensure we have valid token IDs (clip to vocab size)
