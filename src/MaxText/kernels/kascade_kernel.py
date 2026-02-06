@@ -160,7 +160,7 @@ def kascade_attention_kernel(
     # Final normalization (wrapped in pl.when even though j is always 0)
     @pl.when(j == 0)  # Since grid third dim is 1, j is always 0
     def end():
-        l = l_scratch_ref[...]  # (bq, NUM_LANES)
+        l = l_scratch_ref[:, :1]  # (bq, 1) - use first column only for broadcasting
         # Normalize output
         o_ref[...] = (o_scratch_ref[...] / l).astype(o_ref.dtype)
 
