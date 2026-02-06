@@ -394,37 +394,60 @@ class KascadeReuseAttention(nn.Module):
         # Shape: [B, H, Q, top_k + 1]
         my_tile_indices = jnp.concatenate([my_tile_indices, local_tile_indices], axis=-1)
             
-        # 5. MASK-BASED Sparse Attention (no gather, standard 4D ops)
-        # Instead of gathering sparse K,V (creates huge 5D tensors),
-        # compute full Q@K^T and mask out non-selected tiles.
-        # Same accuracy, 10× less memory, uses optimized BLAS matmuls.
+        # 5. BLOCK-SPARSE ATTENTION (per-tile-group, not per-query)
+        #    Group queries by their tile (16 queries per group).
+        #    Each group shares the same K/V tile selection → 16× less gather.
+        #    This is exactly how SplashAttention works on TPU (block-level sparsity).
+        #
+        #    Per-query gather: [B*H, Q=512, sparse_len=272, D=64] = 285M elements
+        #    Per-tile gather:  [B*H, nqt=32, sparse_len=272, D=64] = 17.8M elements
         
-        # Build per-query tile mask: [B, H, Q, num_tiles]
-        # my_tile_indices: [B, H, Q, num_selected]
-        tile_one_hot = jax.nn.one_hot(my_tile_indices, num_tiles)  # [B,H,Q,sel,num_tiles]
-        tile_mask = jnp.sum(tile_one_hot, axis=-2) > 0  # [B, H, Q, num_tiles]
+        num_q_tiles = seq_len // self.tile_size
         
-        # Expand tile mask to token-level: [B, H, Q, S]
-        key_tile_ids = jnp.arange(seq_len) // self.tile_size  # [S]
-        token_mask = tile_mask[:, :, :, key_tile_ids]  # [B, H, Q, S]
+        # Reduce to per-tile: use last query in each tile as representative
+        # (it sees the most context → best tile selection for the group)
+        tile_repr = jnp.arange(self.tile_size - 1, seq_len, self.tile_size)  # [num_q_tiles]
+        tile_sel = my_tile_indices[:, :, tile_repr, :]  # [B, H, num_q_tiles, top_k+1]
         
-        # Full attention logits (standard 4D — cache-friendly, BLAS-optimized)
-        logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) / jnp.sqrt(self.head_dim)
+        # Expand to token indices per tile-group
+        offsets = jnp.arange(self.tile_size)[None, None, None, None, :]  # [1,1,1,1,ts]
+        tile_starts = tile_sel[..., None] * self.tile_size               # [B,H,nqt,sel,1]
+        token_indices = tile_starts + offsets                            # [B,H,nqt,sel,ts]
+        sparse_len = tile_sel.shape[-1] * self.tile_size
+        flat_indices = token_indices.reshape(batch, self.num_heads, num_q_tiles, sparse_len)
+        flat_indices = jnp.clip(flat_indices, 0, seq_len - 1)
         
-        # Apply tile sparsity mask
-        logits = jnp.where(~token_mask, -1e10, logits)
+        # Gather K, V per tile-group (16× smaller than per-query)
+        B, H, S, D = k.shape
+        k_flat = k.reshape(B * H, S, D)
+        v_flat = v.reshape(B * H, S, D)
+        idx_flat = flat_indices.reshape(B * H, num_q_tiles, sparse_len)
         
-        # Apply causal mask
-        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-        logits = jnp.where(~causal_mask[None, None], -1e10, logits)
+        k_sparse = jax.vmap(lambda kv, idx: kv[idx])(k_flat, idx_flat)  # [B*H, nqt, sl, D]
+        v_sparse = jax.vmap(lambda kv, idx: kv[idx])(v_flat, idx_flat)
+        k_sparse = k_sparse.reshape(B, H, num_q_tiles, sparse_len, D)
+        v_sparse = v_sparse.reshape(B, H, num_q_tiles, sparse_len, D)
         
-        # Softmax & weighted sum (standard 4D throughout)
+        # Block-sparse attention: Q_tile @ K_sparse^T per tile-group
+        q_tiled = q.reshape(B, H, num_q_tiles, self.tile_size, D)
+        # [B,H,nqt,ts,D] @ [B,H,nqt,sl,D]^T → [B,H,nqt,ts,sl]
+        logits = jnp.einsum('bhtqd,bhtkd->bhtqk', q_tiled, k_sparse) / jnp.sqrt(self.head_dim)
+        
+        # Causal mask: each query position vs gathered key positions
+        q_pos = jnp.arange(seq_len).reshape(num_q_tiles, self.tile_size)  # [nqt, ts]
+        # flat_indices: [B, H, nqt, sl] → broadcast to [B, H, nqt, 1, sl]
+        future_mask = flat_indices[:, :, :, None, :] > q_pos[None, None, :, :, None]
+        logits = jnp.where(future_mask, -1e10, logits)
+        
+        # Softmax over sparse keys & weighted sum
         weights = jax.nn.softmax(logits, axis=-1)
-        # Handle fully-masked early rows
-        all_masked = (logits <= -1e9).all(axis=-1, keepdims=True)
+        all_masked = jnp.all(future_mask, axis=-1, keepdims=True)
         weights = jnp.where(all_masked, 0.0, weights)
+        weights = jnp.where(jnp.isnan(weights), 0.0, weights)
         
-        output = jnp.einsum('bhqk,bhkd->bhqd', weights, v)
+        # [B,H,nqt,ts,sl] @ [B,H,nqt,sl,D] → [B,H,nqt,ts,D]
+        output = jnp.einsum('bhtqk,bhtkd->bhtqd', weights, v_sparse)
+        output = output.reshape(B, H, seq_len, D)
         output = jnp.transpose(output, (0, 2, 1, 3))
         output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
