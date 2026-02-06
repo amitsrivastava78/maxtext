@@ -17,21 +17,58 @@ DEBUG_MODE = False  # Disable for clean benchmark output
 # Format: { "layer_0_indices": array([Batch, Heads, TopK_Tiles]) }
 KASCADE_CACHE = {}
 
-# RoPE Helper Functions for LLaMA-3.1
-def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
+# RoPE Helper Functions for LLaMA-3.x
+def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0,
+                         rope_scaling: dict = None):
     """
     Precompute the frequency tensor for RoPE (Rotary Position Embedding).
-    LLaMA-3.1 uses theta=500000 instead of standard 10000.
+    Supports LLaMA-3.x 'llama3' rope_scaling with frequency-dependent scaling.
     
     Args:
-        dim: Head dimension (should be 128 for LLaMA-3.1)
+        dim: Head dimension (e.g. 64 for LLaMA-3.2-1B, 128 for LLaMA-3.1-8B)
         end: Maximum sequence length
-        theta: Base for frequency computation (500000 for LLaMA-3.1)
+        theta: Base for frequency computation (500000 for LLaMA-3.x)
+        rope_scaling: Optional dict with keys:
+            - rope_type: "llama3"
+            - factor: scaling factor (e.g. 32.0)
+            - low_freq_factor: (e.g. 1.0)
+            - high_freq_factor: (e.g. 4.0)
+            - original_max_position_embeddings: (e.g. 8192)
     
     Returns:
         Complex tensor of shape [end, dim//2] for RoPE rotation
     """
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
+    freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].astype(np.float64) / dim))
+    
+    # Apply LLaMA-3 rope scaling if configured
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", ""))
+        if rope_type == "llama3":
+            factor = rope_scaling["factor"]
+            low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+            high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+            orig_max_pos = rope_scaling["original_max_position_embeddings"]
+            
+            low_freq_wavelen = orig_max_pos / low_freq_factor
+            high_freq_wavelen = orig_max_pos / high_freq_factor
+            
+            new_freqs = []
+            for freq in freqs:
+                wavelen = 2.0 * np.pi / freq
+                if wavelen < high_freq_wavelen:
+                    # High frequency region: keep original
+                    new_freqs.append(freq)
+                elif wavelen > low_freq_wavelen:
+                    # Low frequency region: scale down by factor
+                    new_freqs.append(freq / factor)
+                else:
+                    # Medium frequency: smooth interpolation
+                    smooth = (orig_max_pos / wavelen - low_freq_factor) / (
+                        high_freq_factor - low_freq_factor)
+                    new_freqs.append((1 - smooth) * freq / factor + smooth * freq)
+            freqs = np.array(new_freqs)
+    
+    freqs = jnp.array(freqs, dtype=jnp.float32)
     t = jnp.arange(end, dtype=jnp.float32)
     freqs = jnp.outer(t, freqs)
     freqs_cis = jnp.exp(1j * freqs)  # Complex exponential
@@ -39,45 +76,46 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
 
 def apply_rope(xq: jnp.ndarray, xk: jnp.ndarray, freqs_cis: jnp.ndarray):
     """
-    Apply RoPE using Adjacent Pairs format (compatible with Meta weights).
-    Correctly pairs dimension (i, i+1) as adjacent pairs.
+    Apply RoPE using Half-Split (rotate_half) format, matching HuggingFace LLaMA.
+    Pairs dimension d with d + dim//2 (NOT adjacent pairs d, d+1).
+    
+    This matches HF's rotate_half convention:
+      x_rotated = x * cos + rotate_half(x) * sin
+    where rotate_half splits x into (x1, x2) at the midpoint and returns (-x2, x1).
     
     Args:
         xq: Query tensor [batch, heads, seq, dim]
         xk: Key tensor [batch, heads, seq, dim]
-        freqs_cis: Precomputed frequency tensor [seq, dim//2]
+        freqs_cis: Precomputed frequency tensor [seq, dim//2] (complex)
     
     Returns:
-        Rotated query and key tensors
+        Rotated query and key tensors in float32
     """
     # xq, xk shape: [Batch, Heads, Seq, Dim]
     # freqs_cis shape: [Seq, Dim//2] (Complex)
     
-    # Cast to float32 for complex operations
+    # Cast to float32
     xq = xq.astype(jnp.float32)
     xk = xk.astype(jnp.float32)
     
-    # Reshape to pairs: [B, H, S, D] -> [B, H, S, D/2, 2]
-    xq_pairs = xq.reshape(*xq.shape[:-1], -1, 2)
-    xk_pairs = xk.reshape(*xk.shape[:-1], -1, 2)
+    # Extract cos and sin from complex frequencies
+    cos = freqs_cis.real[None, None, :xq.shape[2], :]  # [1, 1, S, D//2]
+    sin = freqs_cis.imag[None, None, :xq.shape[2], :]  # [1, 1, S, D//2]
     
-    # Convert pairs to complex: (x0, x1) -> x0 + i*x1
-    xq_complex = jax.lax.complex(xq_pairs[..., 0], xq_pairs[..., 1])
-    xk_complex = jax.lax.complex(xk_pairs[..., 0], xk_pairs[..., 1])
+    # Broadcast to full dimension: [1, 1, S, D]
+    cos_full = jnp.concatenate([cos, cos], axis=-1)
+    sin_full = jnp.concatenate([sin, sin], axis=-1)
     
-    # Reshape frequencies for broadcasting [1, 1, Seq, Dim//2]
-    freqs_cis = freqs_cis[None, None, :xq.shape[2], :]
+    def rotate_half(x):
+        """Split x into two halves and rotate: (x1, x2) -> (-x2, x1)."""
+        half = x.shape[-1] // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        return jnp.concatenate([-x2, x1], axis=-1)
     
-    # Apply rotation (complex multiplication)
-    xq_rotated = xq_complex * freqs_cis
-    xk_rotated = xk_complex * freqs_cis
+    xq_out = xq * cos_full + rotate_half(xq) * sin_full
+    xk_out = xk * cos_full + rotate_half(xk) * sin_full
     
-    # Reconstruct: interleave real and imaginary
-    xq_out = jnp.stack([xq_rotated.real, xq_rotated.imag], axis=-1).reshape(xq.shape)
-    xk_out = jnp.stack([xk_rotated.real, xk_rotated.imag], axis=-1).reshape(xk.shape)
-    
-    # Return in float32 to maintain dtype consistency throughout computation
-    # TPU has issues with mixed precision (bfloat16 Q/K with float32 V)
     return xq_out, xk_out
 
 class KascadeAnchorAttention(nn.Module):

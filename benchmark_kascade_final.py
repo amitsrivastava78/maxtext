@@ -52,6 +52,15 @@ DEFAULT_SEQ_LEN = 512  # Default sequence length
 DEFAULT_DEVICE = 'cpu'  # Default to CPU for compatibility
 DEFAULT_USE_SPLASH = False  # Use optimized SplashAttention kernel
 
+# LLaMA-3.2 RoPE Scaling Configuration
+ROPE_SCALING = {
+    "rope_type": "llama3",
+    "factor": 32.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 8192,
+}
+
 # Global variables (set by parse_args)
 TILE_SIZE = DEFAULT_TILE_SIZE
 TOP_K_OPTIMIZED = DEFAULT_TOP_K
@@ -329,7 +338,8 @@ class LlamaBlock(nn.Module):
         normed = nn.RMSNorm(epsilon=1e-5, name="attention_norm")(x)
         
         seq_len = x.shape[1]
-        freq_cis = precompute_freqs_cis(HEAD_DIM, seq_len, theta=500000.0)
+        freq_cis = precompute_freqs_cis(HEAD_DIM, seq_len, theta=500000.0,
+                                        rope_scaling=ROPE_SCALING)
         
         plan = self.schedule.get(self.layer_id, {"type": "ANCHOR"})
         
