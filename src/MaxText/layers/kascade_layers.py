@@ -181,36 +181,46 @@ class KascadeAnchorAttention(nn.Module):
         logits = jnp.where(mask[None, None, :, :], logits, -1e10)
         weights = jax.nn.softmax(logits, axis=-1)
         
-        # --- REQUIREMENT 3: TILE POOLING & TOP-K ---
+        # --- REQUIREMENT 3: PER-QUERY TILE POOLING & TOP-K (Paper Algorithm) ---
+        # The paper selects top-k tiles PER QUERY POSITION, not just for the last token.
+        # Each query q_i picks its own most important tiles based on its attention weights.
         
-        # A. Extract Attention for the Last Token (The one generating next word)
-        # Shape: [Batch, Heads, Seq_Len]
-        last_token_probs = weights[:, :, -1, :] 
+        # A. Use ALL query positions' attention weights
+        # weights shape: [Batch, Heads, Seq_Len(Q), Seq_Len(K)]
+        all_probs = weights
         
-        # B. Pad Sequence if it doesn't fit tiles perfectly
+        # B. Pad K dimension if it doesn't fit tiles perfectly
         pad_len = (self.tile_size - (seq_len % self.tile_size)) % self.tile_size
         if pad_len > 0:
-            last_token_probs = jnp.pad(last_token_probs, ((0,0), (0,0), (0, pad_len)))
+            all_probs = jnp.pad(all_probs, ((0,0), (0,0), (0,0), (0, pad_len)))
             
-        # C. Reshape into Tiles
-        # Shape: [Batch, Heads, Num_Tiles, Tile_Size]
-        num_tiles = last_token_probs.shape[-1] // self.tile_size
-        tiled_probs = last_token_probs.reshape(batch, self.num_heads, num_tiles, self.tile_size)
+        # C. Reshape K dimension into Tiles
+        # [B, H, Q, K_padded] → [B, H, Q, num_tiles, tile_size]
+        K_padded = all_probs.shape[-1]
+        num_tiles = K_padded // self.tile_size
+        tiled_probs = all_probs.reshape(batch, self.num_heads, seq_len, num_tiles, self.tile_size)
         
-        # D. Max Pooling: Find the single highest probability in each tile
-        # Shape: [Batch, Heads, Num_Tiles]
+        # D. Max Pooling: Find the single highest probability in each tile, per query
+        # Shape: [Batch, Heads, Seq_Len, Num_Tiles]
         tile_scores = jnp.max(tiled_probs, axis=-1) 
         
-        # E. Extract Top-K Indices
-        # Cap top_k by actual number of tiles (avoid error when tiles < top_k)
+        # E. Extract Top-K Indices per query
         num_tiles = tile_scores.shape[-1]
         actual_top_k = min(self.top_k_tiles, num_tiles)
-        # Shape: [Batch, Heads, Top_K]
+        # Shape: [Batch, Heads, Seq_Len, Top_K] — per-query tile selections!
         _, top_tile_indices = jax.lax.top_k(tile_scores, actual_top_k)
         
-        # F. Save to Cache (For Calibration or Reuse)
+        # F. Save to Cache
+        # Per-query indices for REUSE layers: [B, H, Q, top_k]
         cache_key = f"layer_{self.layer_id}_indices"
         KASCADE_CACHE[cache_key] = top_tile_indices
+        # Last-token indices for calibration/scheduling: [B, H, top_k]
+        KASCADE_CACHE[f"layer_{self.layer_id}_indices_calib"] = top_tile_indices[:, :, -1, :]
+        
+        # ALWAYS print top_k for debugging
+        def print_topk():
+            print(f"  Layer {self.layer_id} (ANCHOR): Using top_k={actual_top_k} tiles (out of {num_tiles} total)")
+        jax.debug.callback(print_topk)
         
         # Debug Visualization
         if DEBUG_MODE:
@@ -218,10 +228,19 @@ class KascadeAnchorAttention(nn.Module):
                 print(f"  [Anchor L{self.layer_id}] Selected Top-{actual_top_k} Tiles (Head 0): {idx[0,0]}")
             jax.debug.callback(print_anchor, top_tile_indices)
         
-        # Finish Layer
+        # G. ANCHOR always uses FULL attention for output.
+        # The top-k tile selection is ONLY for caching indices for REUSE layers.
+        # Sparsity comes from REUSE layers, not ANCHOR.
         output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
         output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        
+        # Debug: track output stats
+        if DEBUG_MODE:
+            def print_anchor_stats(out, lid):
+                print(f"   [ANCHOR L{lid}] output: mean={float(jnp.mean(out)):.6f}, std={float(jnp.std(out)):.6f}, "
+                      f"norm={float(jnp.linalg.norm(out)):.4f}, has_nan={bool(jnp.any(jnp.isnan(out)))}")
+            jax.debug.callback(print_anchor_stats, output, self.layer_id)
         
         # --- DEBUG: Check for NaN ---
         if DEBUG_MODE:
@@ -276,7 +295,7 @@ class KascadeReuseAttention(nn.Module):
         if freq_cis is not None:
             q, k = apply_rope(q, k, freq_cis)
 
-        # 2. Retrieve Anchor Indices
+        # 2. Retrieve Per-Query Anchor Indices
         cache_key = f"layer_{self.anchor_layer_id}_indices"
         anchor_indices = KASCADE_CACHE.get(cache_key, None)
         
@@ -286,13 +305,14 @@ class KascadeReuseAttention(nn.Module):
                 f"Anchor layer {self.anchor_layer_id} must run before REUSE layer can access its indices."
             )
         
-        # 3. Apply Head Mapping
+        # anchor_indices shape: [B, H, Q, top_k] (per-query tile selections)
+        
+        # 3. Apply Head Mapping (per-query)
         if self.head_map is not None:
             perm_list = [self.head_map.get(h, h) for h in range(self.num_heads)]
             perm_indices = jnp.array(perm_list, dtype=jnp.int32)
-            my_tile_indices = anchor_indices[:, perm_indices, :]
+            my_tile_indices = anchor_indices[:, perm_indices, :, :]  # [B, H, Q, top_k]
             
-            # Debug Proof (Show the Shuffle)
             if DEBUG_MODE:
                 def print_map(p):
                     print(f"  [Reuse  L{self.anchor_layer_id+1}..] Applied Map: H0 uses Anchor H{p[0]}, H1 uses Anchor H{p[1]}...")
@@ -300,58 +320,84 @@ class KascadeReuseAttention(nn.Module):
         else:
             my_tile_indices = anchor_indices
             
-        # 4. Expand to Tokens (Gather Logic)
-        offsets = jnp.arange(self.tile_size)[None, None, None, :]
-        tile_starts = my_tile_indices[..., None] * self.tile_size
-        token_indices = tile_starts + offsets
-        flat_token_indices = token_indices.reshape(batch, self.num_heads, -1)
+        # 4. Add PER-QUERY LOCAL TILE for causal context
+        # Each query at position q gets its own local tile: tile = q // tile_size
+        num_tiles = seq_len // self.tile_size
+        local_tiles = jnp.arange(seq_len) // self.tile_size  # [Q]
+        local_tile_indices = local_tiles[None, None, :, None]  # [1, 1, Q, 1]
+        local_tile_indices = jnp.broadcast_to(
+            local_tile_indices, (batch, self.num_heads, seq_len, 1)
+        ).astype(jnp.int32)
         
-        # --- CRITICAL FIX: Clip indices to valid range [0, seq_len-1] ---
-        # This prevents out-of-bounds gather that causes NaN
+        # Concatenate: [sparse tiles from anchor] + [local tile per query]
+        # Shape: [B, H, Q, top_k + 1]
+        my_tile_indices = jnp.concatenate([my_tile_indices, local_tile_indices], axis=-1)
+            
+        # 5. Expand to Token Indices (per-query)
+        # my_tile_indices: [B, H, Q, num_selected_tiles]
+        offsets = jnp.arange(self.tile_size)[None, None, None, None, :]  # [1,1,1,1,tile_size]
+        tile_starts = my_tile_indices[..., None] * self.tile_size  # [B,H,Q,tiles,1]
+        token_indices = tile_starts + offsets  # [B,H,Q,tiles,tile_size]
+        sparse_len = my_tile_indices.shape[-1] * self.tile_size
+        flat_token_indices = token_indices.reshape(batch, self.num_heads, seq_len, sparse_len)
+        # [B, H, Q, sparse_len] — each query has its own set of key indices!
+        
         flat_token_indices = jnp.clip(flat_token_indices, 0, seq_len - 1)
         
-        # Debug print to show sparse computation size (only prints shape, not traced values)
         if DEBUG_MODE:
             def print_sparse_info(shape_val):
-                print(f"  [Reuse  L{self.anchor_layer_id+1}..] Using {shape_val} sparse tokens (vs {seq_len} full)")
-            jax.debug.callback(print_sparse_info, flat_token_indices.shape[2])
+                print(f"  [Reuse  L{self.anchor_layer_id+1}..] Using {shape_val} sparse tokens per query (vs {seq_len} full)")
+            jax.debug.callback(print_sparse_info, flat_token_indices.shape[3])
         
-        # 5. Perform Gather
-        k_sparse = jnp.take_along_axis(k, flat_token_indices[..., None], axis=2)
-        v_sparse = jnp.take_along_axis(v, flat_token_indices[..., None], axis=2)
+        # 6. Per-Query Gather of K, V
+        # k: [B, H, S, D], flat_token_indices: [B, H, Q, sparse_len]
+        # We need: k_sparse[b,h,q,i,:] = k[b,h, idx[b,h,q,i], :]
+        B, H, S, D = k.shape
+        k_flat = k.reshape(B * H, S, D)
+        v_flat = v.reshape(B * H, S, D)
+        idx_flat = flat_token_indices.reshape(B * H, seq_len, sparse_len)
+        
+        def gather_per_query(kv_bh, idx_bh):
+            # kv_bh: [S, D], idx_bh: [Q, sparse_len]
+            return kv_bh[idx_bh]  # Advanced indexing: [Q, sparse_len, D]
+        
+        k_sparse = jax.vmap(gather_per_query)(k_flat, idx_flat)  # [B*H, Q, sparse_len, D]
+        v_sparse = jax.vmap(gather_per_query)(v_flat, idx_flat)
+        k_sparse = k_sparse.reshape(B, H, seq_len, sparse_len, D)
+        v_sparse = v_sparse.reshape(B, H, seq_len, sparse_len, D)
 
-        # 6. Compute Sparse Logits
-        # Q: [B, H, Seq, D]  @ K_T: [B, H, D, Sparse_Len]
-        sparse_logits = jnp.einsum('bhqd,bhkd->bhqk', q, k_sparse) / jnp.sqrt(self.head_dim)
+        # 7. Per-Query Sparse Attention
+        # q: [B, H, Q, D], k_sparse: [B, H, Q, sparse_len, D]
+        sparse_logits = jnp.einsum('bhqd,bhqkd->bhqk', q, k_sparse) / jnp.sqrt(self.head_dim)
         
-        # --- FIX 2: CAUSAL MASKING ---
-        # We need to mask positions where Key_Index > Query_Index.
-        # Query Indices: [0, 1, 2 ... Seq_Len]
-        # Key Indices: flat_token_indices [Key1, Key2 ...]
-        
-        # Broadcast to compare: [1, 1, Seq, 1] vs [B, H, 1, Sparse_Len]
-        query_idx = jnp.arange(seq_len)[None, None, :, None]
-        key_idx = flat_token_indices[:, :, None, :]
-        
-        # Mask: 1 if Key > Query (Future), 0 otherwise
+        # Causal mask: per-query, each query's key indices checked
+        query_idx = jnp.arange(seq_len)[None, None, :, None]  # [1, 1, Q, 1]
+        key_idx = flat_token_indices  # [B, H, Q, sparse_len]
         future_mask = (key_idx > query_idx)
-        
-        # Apply mask (-1e10 is standard for neg infinity)
         sparse_logits = jnp.where(future_mask, -1e10, sparse_logits)
 
-        # 7. Softmax & Output
+        # 8. Softmax & Output
         sparse_weights = jax.nn.softmax(sparse_logits, axis=-1)
         
-        # --- CRITICAL FIX: Handle fully-masked rows (all -inf) that produce NaN in softmax ---
-        # When all keys are masked (future), softmax produces NaN. Replace with uniform distribution.
-        is_nan = jnp.isnan(sparse_weights)
-        sparse_weights = jnp.where(is_nan, 1.0 / sparse_weights.shape[-1], sparse_weights)
+        # Handle fully-masked rows (early queries where all keys are future)
+        is_fully_masked = jnp.all(future_mask, axis=-1, keepdims=True)
+        sparse_weights = jnp.where(is_fully_masked, 0.0, sparse_weights)
+        sparse_weights = jnp.where(jnp.isnan(sparse_weights), 0.0, sparse_weights)
         
-        output = jnp.einsum('bhqk,bhkd->bhqd', sparse_weights, v_sparse)
+        # v_sparse: [B, H, Q, sparse_len, D]
+        output = jnp.einsum('bhqk,bhqkd->bhqd', sparse_weights, v_sparse)
         
         output = jnp.transpose(output, (0, 2, 1, 3))
         output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        
+        # Debug: track output stats  
+        if DEBUG_MODE:
+            def print_reuse_stats(out, weights_sum, aid):
+                print(f"   [REUSE  from L{aid}] output: mean={float(jnp.mean(out)):.6f}, std={float(jnp.std(out)):.6f}, "
+                      f"norm={float(jnp.linalg.norm(out)):.4f}, has_nan={bool(jnp.any(jnp.isnan(out)))}, "
+                      f"weights_sum={float(jnp.mean(weights_sum)):.6f}")
+            jax.debug.callback(print_reuse_stats, output, jnp.sum(sparse_weights, axis=-1), self.anchor_layer_id)
         
         # --- DEBUG: Check for NaN ---
         if DEBUG_MODE:

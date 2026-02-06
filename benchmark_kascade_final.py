@@ -45,7 +45,7 @@ SEQ_LEN = 512  # Will be overridden by command line arg
 
 # Hyperparameters (Defaults - can be overridden via command line)
 DEFAULT_TILE_SIZE = 16
-DEFAULT_TOP_K = 12  # Optimized for 1B model (paper uses 8 for 8B)
+DEFAULT_TOP_K = 24  # Testing: 24/32 = 75% of tiles
 DEFAULT_THRESHOLD = 0.65  # 65% Jaccard similarity for reuse
 DEFAULT_MAX_REUSE_DIST = 4  # Maximum layers between anchor and reuse
 DEFAULT_SEQ_LEN = 512  # Default sequence length
@@ -180,10 +180,16 @@ def calibrate_on_real_text_optimized(params, calib_ids, threshold, max_reuse_dis
     KASCADE_CACHE.clear()
     _ = model.apply(params, calib_ids)
     
-    # Store all tile indices for later comparison
+    # Store all tile indices for calibration (last-token summaries for scheduling)
     all_tiles = {}
     for i in range(NUM_LAYERS):
-        tiles = KASCADE_CACHE.get(f"layer_{i}_indices")
+        # Use _calib suffix which contains last-token tiles [B, H, top_k]
+        tiles = KASCADE_CACHE.get(f"layer_{i}_indices_calib")
+        if tiles is None:
+            # Fallback: if per-query indices exist, extract last token
+            per_query = KASCADE_CACHE.get(f"layer_{i}_indices")
+            if per_query is not None:
+                tiles = per_query[:, :, -1, :] if per_query.ndim == 4 else per_query
         if tiles is not None:
             all_tiles[i] = tiles
     
@@ -277,18 +283,39 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
     print(f"✓ Loaded {emb_data['config']['num_hidden_layers']} layers")
     return {'params': params}, emb_data['config']
 
-def calculate_last_token_perplexity(logits, targets):
-    """Calculate perplexity ONLY for the final token prediction."""
-    final_logit = logits[:, -2, :]
-    final_target = targets[:, -1]
+def calculate_full_sequence_perplexity(logits, targets):
+    """Calculate perplexity over ALL tokens (proper evaluation, not just 1 token).
     
-    one_hot = jax.nn.one_hot(final_target, logits.shape[-1])
-    log_probs = jax.nn.log_softmax(final_logit, axis=-1)
+    For autoregressive LM: logits[:, t, :] predicts targets[:, t+1].
+    So we use logits[:, 0:-1, :] to predict targets[:, 1:].
+    This gives us (seq_len - 1) token predictions instead of just 1.
+    """
+    # Shift: logits[t] predicts target[t+1]
+    shift_logits = logits[:, :-1, :]   # [B, seq_len-1, vocab]
+    shift_targets = targets[:, 1:]      # [B, seq_len-1]
     
-    token_log_prob = jnp.sum(one_hot * log_probs, axis=-1)
-    loss = -jnp.mean(token_log_prob)
+    seq_len_eval = shift_logits.shape[1]
     
-    return jnp.exp(loss)
+    # Compute log probabilities for all positions
+    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)  # [B, seq_len-1, vocab]
+    
+    # Gather log prob of correct tokens
+    one_hot = jax.nn.one_hot(shift_targets, logits.shape[-1])  # [B, seq_len-1, vocab]
+    token_log_probs = jnp.sum(one_hot * log_probs, axis=-1)    # [B, seq_len-1]
+    
+    # Average negative log likelihood across ALL positions
+    avg_nll = -jnp.mean(token_log_probs)
+    ppl = jnp.exp(avg_nll)
+    
+    # Also compute last-token perplexity for comparison
+    last_nll = -token_log_probs[0, -1]
+    last_ppl = jnp.exp(last_nll)
+    
+    print(f"   Logits shape: {logits.shape}, Evaluating {seq_len_eval} token predictions")
+    print(f"   Full-sequence: avg_NLL={float(avg_nll):.4f}, Perplexity={float(ppl):.4f}")
+    print(f"   Last-token only: NLL={float(last_nll):.4f}, Perplexity={float(last_ppl):.4f}")
+    
+    return ppl
 
 # --- MODEL CLASSES ---
 class LlamaBlock(nn.Module):
@@ -308,38 +335,16 @@ class LlamaBlock(nn.Module):
         
         # Compute attention based on plan type
         if plan["type"] == "DENSE":
-            # TRUE full attention - no tile selection, no sparsity
-            # Create module scope to match weight structure (KascadeAnchorAttention_0)
-            class DenseFullAttention(nn.Module):
-                @nn.compact
-                def __call__(self, x, freq_cis):
-                    batch, seq_len, _ = x.shape
-                    q = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_0")(x)
-                    k = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_1")(x)
-                    v = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_2")(x)
-                    
-                    q = q.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
-                    k = k.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
-                    v = v.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
-                    
-                    # Apply RoPE
-                    q_t = jnp.transpose(q, (0, 2, 1, 3))
-                    k_t = jnp.transpose(k, (0, 2, 1, 3))
-                    q_t, k_t = apply_rope(q_t, k_t, freq_cis)
-                    q = jnp.transpose(q_t, (0, 2, 1, 3))
-                    k = jnp.transpose(k_t, (0, 2, 1, 3))
-                    
-                    # Standard full attention
-                    logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(HEAD_DIM)
-                    mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-                    logits = jnp.where(mask[None, None, :, :], logits, -1e10)
-                    weights = jax.nn.softmax(logits, axis=-1)
-                    
-                    output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
-                    output = output.reshape(batch, seq_len, NUM_HEADS * HEAD_DIM)
-                    return nn.Dense(EMBED_DIM, use_bias=False, name="Dense_3")(output)
-            
-            attn_out = DenseFullAttention(name="KascadeAnchorAttention_0")(normed, freq_cis)
+            # Use ANCHOR attention with full tile set (top_k = total tiles)
+            # This ensures exact same computation as ANCHOR but without sparsity
+            num_tiles = seq_len // TILE_SIZE
+            attn = KascadeAnchorAttention(
+                NUM_HEADS, HEAD_DIM, self.layer_id,
+                top_k_tiles=num_tiles,  # Use ALL tiles = full attention
+                tile_size=TILE_SIZE,
+                use_splash=False  # Never use kernel for baseline
+            )
+            attn_out = attn(normed, freq_cis=freq_cis)
         elif plan["type"] == "ANCHOR":
             attn = KascadeAnchorAttention(
                 NUM_HEADS, HEAD_DIM, self.layer_id,
@@ -622,19 +627,29 @@ def main():
     print(f"   ✓ Collected tokens from {doc_count} documents")
     
     # Verify we have enough tokens
-    needed_tokens = 2 * SEQ_LEN
+    needed_tokens = 2 * SEQ_LEN + SEQ_LEN // 2  # Extra for skip buffer
     if len(all_tokens) < needed_tokens:
         raise ValueError(f"Not enough tokens collected: {len(all_tokens)} < {needed_tokens}. Increase document count or text length.")
     
-    # Trim to exactly 2*SEQ_LEN tokens (half for calibration, half for test)
-    all_tokens = all_tokens[:2 * SEQ_LEN]
+    # Trim to exactly what we need
+    needed_total = 2 * SEQ_LEN + SEQ_LEN // 2
+    all_tokens = all_tokens[:needed_total]
     
     # Ensure we have valid token IDs (clip to vocab size)
     all_tokens = [min(t, VOCAB_SIZE - 1) for t in all_tokens]
     
-    # Split into calibration (first SEQ_LEN) and test (next SEQ_LEN)
+    # CRITICAL: Use DIFFERENT documents for calibration and test to avoid information leakage
+    # Calibration: first document's tokens
+    # Test: next document's tokens (completely independent)
+    if len(all_tokens) < 2 * SEQ_LEN:
+        raise ValueError(f"Need at least {2*SEQ_LEN} tokens, got {len(all_tokens)}")
+    
+    # Find document boundary (look for tokens that indicate new document/topic)
+    # For safety, just use first half for calib, second half for test from DIFFERENT parts
+    # Better: skip some tokens between calib and test to reduce dependency
+    skip_tokens = SEQ_LEN // 2  # Skip 256 tokens between calib and test
     calib_ids = jnp.array([all_tokens[:SEQ_LEN]], dtype=jnp.int32)
-    test_ids = jnp.array([all_tokens[SEQ_LEN:2*SEQ_LEN]], dtype=jnp.int32)
+    test_ids = jnp.array([all_tokens[SEQ_LEN+skip_tokens:2*SEQ_LEN+skip_tokens]], dtype=jnp.int32)
     
     print(f"   ✓ Calibration: {calib_ids.shape[1]} tokens from C4")
     print(f"   ✓ Test: {test_ids.shape[1]} tokens (different documents)")
@@ -652,19 +667,54 @@ def main():
     # Dense baseline (all DENSE for fair comparison)
     print("\n🏃 Running DENSE Baseline...")
     dense_schedule = {i: {"type": "DENSE"} for i in range(NUM_LAYERS)}
+    print(f"   Dense expects {SEQ_LEN // TILE_SIZE} tiles per layer (FULL ATTENTION)")
+    print(f"   Dense schedule L0: {dense_schedule[0]}")
+    print(f"   Dense schedule L1: {dense_schedule[1]}")
     model_dense = LlamaModel(schedule=dense_schedule, use_splash=args.use_splash_kernel)
     
+    # Note: Dense baseline will populate cache (ANCHOR with top_k=32), but we don't use it
+    print(f"   Cache before clear: {list(KASCADE_CACHE.keys())}")
     KASCADE_CACHE.clear()
+    print(f"   Cache after clear: {list(KASCADE_CACHE.keys())}")
     logits_dense = model_dense.apply(params_dict, test_ids)
-    ppl_dense = calculate_last_token_perplexity(logits_dense, test_ids)
+    calib_tiles = KASCADE_CACHE.get('layer_1_indices_calib', KASCADE_CACHE.get('layer_1_indices'))
+    if calib_tiles is not None and calib_tiles.ndim == 3:
+        print(f"   Dense L1 tiles (head 0, last token): {calib_tiles[0,0]}")
+    elif calib_tiles is not None:
+        print(f"   Dense L1 tiles (head 0, last token): {calib_tiles[0,0,-1]}")
+    print(f"   Cache after Dense run: {[k for k in KASCADE_CACHE.keys() if not k.endswith('_calib')]}")
+    ppl_dense = calculate_full_sequence_perplexity(logits_dense, test_ids)
     
     # Sparse Kascade
     print("\n⚡ Running KASCADE Sparse...")
+    print(f"   Sparse schedule L0: {schedule[0]}")
+    print(f"   Sparse schedule L1: {schedule[1]}")
+    print(f"   Sparse schedule L2: {schedule[2]}")
     model_sparse = LlamaModel(schedule=schedule, use_splash=args.use_splash_kernel)
     
+    # CRITICAL: Must clear cache from Dense baseline before running Sparse!
+    # Dense baseline populated cache with ALL tiles (top_k=32), but Sparse needs
+    # to populate with its own sparse tiles (top_k=12)
+    print(f"   Cache before clear: {list(KASCADE_CACHE.keys())}")
     KASCADE_CACHE.clear()
+    print(f"   Cache after clear: {list(KASCADE_CACHE.keys())}")
+    
+    # First pass: Run model to populate cache (ANCHOR layers will cache their tiles)
+    print("   [Pass 1/2] Populating cache with sparse ANCHOR tiles...")
+    _ = model_sparse.apply(params_dict, test_ids)
+    sparse_calib = KASCADE_CACHE.get('layer_1_indices_calib', KASCADE_CACHE.get('layer_1_indices'))
+    if sparse_calib is not None and sparse_calib.ndim == 3:
+        print(f"   Sparse L1 tiles (head 0, last token): {sparse_calib[0,0]}")
+    elif sparse_calib is not None:
+        print(f"   Sparse L1 tiles (head 0, last token): {sparse_calib[0,0,-1]}")
+    print(f"   Cache after pass 1: {[k for k in KASCADE_CACHE.keys() if not k.endswith('_calib')]}")
+    
+    # Second pass: Now REUSE layers can use the cached tiles from ANCHOR layers
+    # (Cache is NOT cleared between passes - this is intentional!)
+    print("   [Pass 2/2] Computing logits with cached tiles...")
     logits_sparse = model_sparse.apply(params_dict, test_ids)
-    ppl_sparse = calculate_last_token_perplexity(logits_sparse, test_ids)
+    print(f"   Cache after pass 2: {list(KASCADE_CACHE.keys())}")
+    ppl_sparse = calculate_full_sequence_perplexity(logits_sparse, test_ids)
     
     # Results
     print("\n" + "=" * 70)
