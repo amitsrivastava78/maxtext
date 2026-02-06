@@ -11,7 +11,7 @@ from flax import linen as nn
 import numpy as np
 
 # Debug Mode Flag - Set to False for production benchmarks
-DEBUG_MODE = False
+DEBUG_MODE = True  # Enable dtype diagnostics
 
 # Global Cache to pass data between layers during Calibration & Inference
 # Format: { "layer_0_indices": array([Batch, Heads, TopK_Tiles]) }
