@@ -560,37 +560,58 @@ def main():
     
     print(f"\n  {n_runs} runs each (warmup 2)...")
     
-    # Warmup
-    KASCADE_CACHE.clear()
-    _ = model_dense.apply(params_dict, test_ids)
-    jax.block_until_ready(_)
-    KASCADE_CACHE.clear()
-    _ = model_sparse.apply(params_dict, test_ids)
-    jax.block_until_ready(_)
-    KASCADE_CACHE.clear()
-    _ = model_dense.apply(params_dict, test_ids)
-    jax.block_until_ready(_)
-    KASCADE_CACHE.clear()
-    _ = model_sparse.apply(params_dict, test_ids)
-    jax.block_until_ready(_)
+    # Use forward_hidden for timing to avoid materializing full logits
+    # At 32K: hidden=[1,32768,2048]=256MB vs logits=[1,32768,128256]=16.8GB
+    use_hidden = SEQ_LEN > 4096
     
-    # Dense
+    # Free PPL intermediates before speedup benchmark
+    import gc
+    del ppl_dense, ppl_sparse
+    gc.collect()
+    
+    # Warmup (2 rounds each)
+    for _ in range(2):
+        KASCADE_CACHE.clear()
+        if use_hidden:
+            out = model_dense.apply(params_dict, test_ids, method=model_dense.forward_hidden)
+        else:
+            out = model_dense.apply(params_dict, test_ids)
+        jax.block_until_ready(out)
+        del out
+        
+        KASCADE_CACHE.clear()
+        if use_hidden:
+            out = model_sparse.apply(params_dict, test_ids, method=model_sparse.forward_hidden)
+        else:
+            out = model_sparse.apply(params_dict, test_ids)
+        jax.block_until_ready(out)
+        del out
+    
+    # Dense timing
     dense_times = []
     for i in range(n_runs):
         KASCADE_CACHE.clear()
         start = time.perf_counter()
-        out = model_dense.apply(params_dict, test_ids)
+        if use_hidden:
+            out = model_dense.apply(params_dict, test_ids, method=model_dense.forward_hidden)
+        else:
+            out = model_dense.apply(params_dict, test_ids)
         jax.block_until_ready(out)
         dense_times.append(time.perf_counter() - start)
+        del out
     
-    # Sparse
+    # Sparse timing
     sparse_times = []
     for i in range(n_runs):
         KASCADE_CACHE.clear()
         start = time.perf_counter()
-        out = model_sparse.apply(params_dict, test_ids)
+        if use_hidden:
+            out = model_sparse.apply(params_dict, test_ids, method=model_sparse.forward_hidden)
+        else:
+            out = model_sparse.apply(params_dict, test_ids)
         jax.block_until_ready(out)
         sparse_times.append(time.perf_counter() - start)
+        del out
     
     dense_avg = sum(dense_times) / len(dense_times) * 1000
     sparse_avg = sum(sparse_times) / len(sparse_times) * 1000

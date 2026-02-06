@@ -122,10 +122,12 @@ def memory_efficient_causal_attention(q, k, v):
     """
     platform = jax.devices()[0].platform
     if platform == 'tpu':
+        # Do NOT specify implementation='xla' -- broken in JAX 0.9.0.1
+        # (returns unblended attention, PPL ≈ vocab_size = random)
+        # Let JAX auto-detect the best flash attention implementation.
         output = jax.nn.dot_product_attention(
             q, k, v,
             is_causal=True,
-            implementation='xla',
         )
         return output
     else:

@@ -134,12 +134,20 @@ def _block_mask_to_2d_union(block_mask, tile_size):
     block_causal = jnp.tril(jnp.ones((Qg, Kg), dtype=jnp.bool_))
     union_mask = union_mask & block_causal
     
-    # Expand to token level with fused causal masking.
-    # Creates only ONE S×S output (avoids double-materializing S×S arrays).
+    # Construct token-level mask on CPU to avoid TPU HBM pressure.
+    # PROBLEM: Fancy indexing on TPU creates int32[S,S] gather indices = 4GB OOM.
+    # SOLUTION: Use NumPy on host CPU (12+ GB RAM), transfer final 1GB bool mask.
     seq_len = Qg * tile_size
-    row_idx = jnp.arange(seq_len)[:, None]  # [S, 1]
-    col_idx = jnp.arange(seq_len)[None, :]  # [1, S]
-    mask_2d = union_mask[row_idx // tile_size, col_idx // tile_size] & (row_idx >= col_idx)
+    union_np = np.asarray(union_mask)  # [Qg, Kg] → CPU
+    
+    # Expand blocks to tokens: repeat each block entry tile_size times per axis
+    mask_np = np.repeat(np.repeat(union_np, tile_size, axis=0), tile_size, axis=1)
+    # Apply token-level causal (tril zeros upper triangle, in-place for memory)
+    mask_np = np.tril(mask_np).astype(np.bool_)
+    
+    # Transfer to TPU (1GB for 32K seq_len)
+    mask_2d = jax.device_put(jnp.array(mask_np))
+    del mask_np  # Free CPU memory immediately
     
     return mask_2d
 
