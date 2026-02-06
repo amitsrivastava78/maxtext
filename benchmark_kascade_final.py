@@ -94,45 +94,84 @@ def solve_head_mapping_corrected(reuse_tiles, anchor_tiles, num_heads):
     avg_score = total_score / num_heads
     return avg_score, mapping
 
-def generate_schedule_structure(consecutive_similarities, num_layers, threshold=0.65, max_reuse_dist=4):
-    """Generate schedule structure determining ANCHOR vs REUSE (without head mappings yet)."""
-    print(f"\n⚡ Generating Optimized Schedule:")
-    print(f"   Similarity threshold: {threshold:.2%} (tuned for 1B)")
-    print(f"   Max reuse distance: {max_reuse_dist}")
-    
-    # CRITICAL: Layer 0 MUST be DENSE (paper Section 3.1)
+def _build_schedule(consecutive_similarities, num_layers, threshold, max_reuse_dist):
+    """Build a schedule with the given threshold. Returns (schedule, reuse_count)."""
     schedule = {0: {"type": "DENSE"}}
-    print("  Layer 0: DENSE (full attention - paper requirement)")
-    
-    # Layer 1 is first ANCHOR
     schedule[1] = {"type": "ANCHOR"}
-    print("  Layer 1: ANCHOR (first sparse layer)")
     last_anchor = 1
     
     for i in range(2, num_layers):
         if i not in consecutive_similarities:
             schedule[i] = {"type": "ANCHOR"}
             last_anchor = i
-            print(f"  Layer {i}: ANCHOR (no data)")
             continue
         
         score = consecutive_similarities[i]
         distance = i - last_anchor
         
         if score >= threshold and distance < max_reuse_dist:
-            print(f"  Layer {i}: REUSE L{last_anchor} (consecutive similarity: {score:.2%})")
             schedule[i] = {
                 "type": "REUSE",
                 "anchor_id": last_anchor,
-                "head_map": {}  # Will be filled in second pass
+                "head_map": {}
             }
         else:
             schedule[i] = {"type": "ANCHOR"}
             last_anchor = i
-            if score < threshold:
-                print(f"  Layer {i}: ANCHOR (low similarity: {score:.2%})")
-            else:
-                print(f"  Layer {i}: ANCHOR (distance: {distance})")
+    
+    reuse_count = sum(1 for v in schedule.values() if v["type"] == "REUSE")
+    return schedule, reuse_count
+
+
+def generate_schedule_structure(consecutive_similarities, num_layers, threshold=0.65, max_reuse_dist=4):
+    """Generate schedule structure determining ANCHOR vs REUSE (without head mappings yet).
+    
+    Auto-adaptive: if user's threshold yields 0 REUSE layers, automatically
+    lower to median similarity to enable REUSE. This handles varying seq_len/
+    tile_size/top_k combinations where absolute similarity values differ.
+    """
+    print(f"\n⚡ Generating Optimized Schedule:")
+    print(f"   Max reuse distance: {max_reuse_dist}")
+    
+    # Show similarity statistics
+    sim_values = [v for v in consecutive_similarities.values()]
+    if sim_values:
+        median_sim = sorted(sim_values)[len(sim_values) // 2]
+        print(f"   Layer similarities: min={min(sim_values):.2%}, median={median_sim:.2%}, max={max(sim_values):.2%}")
+    else:
+        median_sim = 0.0
+    
+    # Try user's threshold first
+    schedule, reuse_count = _build_schedule(consecutive_similarities, num_layers, threshold, max_reuse_dist)
+    
+    if reuse_count == 0 and sim_values:
+        # Auto-adapt: lower threshold to median similarity to get REUSE layers
+        adaptive_threshold = median_sim * 0.90  # 90% of median → roughly half the layers become REUSE
+        schedule_adaptive, reuse_adaptive = _build_schedule(consecutive_similarities, num_layers, adaptive_threshold, max_reuse_dist)
+        
+        if reuse_adaptive > 0:
+            print(f"   ⚠️  Threshold {threshold:.2%} yields 0 REUSE layers")
+            print(f"   🔧 Auto-adapted threshold: {adaptive_threshold:.2%} (90% of median similarity)")
+            print(f"   → {reuse_adaptive} REUSE layers enabled")
+            threshold = adaptive_threshold
+            schedule = schedule_adaptive
+            reuse_count = reuse_adaptive
+        else:
+            print(f"   Threshold: {threshold:.2%} (0 REUSE layers — similarities too low)")
+    else:
+        print(f"   Threshold: {threshold:.2%} → {reuse_count} REUSE layers")
+    
+    # Print schedule
+    print(f"  Layer 0: DENSE (full attention - paper requirement)")
+    print(f"  Layer 1: ANCHOR (first sparse layer)")
+    for i in range(2, num_layers):
+        plan = schedule[i]
+        if plan["type"] == "REUSE":
+            score = consecutive_similarities.get(i, 0)
+            print(f"  Layer {i}: REUSE L{plan['anchor_id']} (similarity: {score:.2%})")
+        else:
+            score = consecutive_similarities.get(i, 0)
+            print(f"  Layer {i}: ANCHOR (similarity: {score:.2%})")
     
     return schedule
 
@@ -790,21 +829,42 @@ def main():
     print(f"   Sparse:  {sparse_avg:.1f} ms  (best: {sparse_min:.1f} ms)")
     print(f"   Speedup: {speedup:.2f}x avg, {speedup_best:.2f}x best")
     
-    # Analysis
+    # Analysis — ANCHOR computes FULL attention (+ tile scoring overhead)
+    # Only REUSE layers do sparse attention (that's where speedup comes from)
     num_tiles = SEQ_LEN // TILE_SIZE
     attn_fraction = (SEQ_LEN * SEQ_LEN) / (SEQ_LEN * SEQ_LEN + 3 * SEQ_LEN * EMBED_DIM + 3 * SEQ_LEN * MLP_DIM)
-    reuse_frac = reuse_count / NUM_LAYERS
-    sparse_ratio = TOP_K_OPTIMIZED / num_tiles
-    theoretical_attn_speedup = 1.0 / (1 - reuse_frac + reuse_frac * sparse_ratio)
+    sparse_ratio = TOP_K_OPTIMIZED / num_tiles  # fraction of tiles kept
+    
+    # Count layer types
+    dense_count = sum(1 for v in schedule.values() if v["type"] == "DENSE")
+    anchor_count = sum(1 for v in schedule.values() if v["type"] == "ANCHOR")
+    # reuse_count already computed
+    
+    # ANCHOR cost: full attention O(S²) + tile scoring overhead (small)
+    # ANCHOR ≈ 1.0x of dense (paper: anchor computes full attention)
+    # Tile scoring from full attention weights is negligible (just max-pool + top_k)
+    anchor_ratio = 1.0  # full attention, same cost as dense
+    
+    # REUSE cost: sparse attention only (no full Q@K^T)
+    reuse_ratio = TOP_K_OPTIMIZED * TILE_SIZE / SEQ_LEN  # e.g., 16*16/4096 = 6.25%
+    
+    # Weighted attention cost across all layers
+    total_attn_cost = (dense_count * 1.0 + anchor_count * anchor_ratio + reuse_count * reuse_ratio)
+    full_attn_cost = NUM_LAYERS * 1.0
+    theoretical_attn_speedup = full_attn_cost / total_attn_cost if total_attn_cost > 0 else 1.0
     theoretical_total_speedup = 1.0 / (1 - attn_fraction + attn_fraction / theoretical_attn_speedup)
     
     print(f"\n📐 Analysis:")
     print(f"   Tiles: {num_tiles}, Top-K: {TOP_K_OPTIMIZED} ({sparse_ratio:.0%} of tiles)")
-    print(f"   REUSE layers: {reuse_count}/{NUM_LAYERS} ({reuse_frac:.0%})")
+    print(f"   Schedule: {dense_count} DENSE + {anchor_count} ANCHOR (full attn) + {reuse_count} REUSE (sparse)")
+    print(f"   ANCHOR: full attention + caches tile indices for REUSE")
+    print(f"   REUSE:  sparse attention ({reuse_ratio:.1%} of tokens) using borrowed indices")
     print(f"   Attention fraction of total FLOPs: {attn_fraction:.1%}")
     print(f"   Theoretical attention-only speedup: {theoretical_attn_speedup:.2f}x")
     print(f"   Theoretical total speedup: {theoretical_total_speedup:.2f}x")
-    print(f"   (4x attention speedup needs longer sequences where O(n²) dominates)")
+    if reuse_count == 0:
+        print(f"   ⚠️  0 REUSE layers → ANCHOR=Dense, no speedup expected")
+        print(f"   💡 Lower --threshold (try 0.30) to enable REUSE layers")
     
     if speedup > 1.2:
         print(f"\n✅ Sparse is {speedup:.2f}x faster!")
