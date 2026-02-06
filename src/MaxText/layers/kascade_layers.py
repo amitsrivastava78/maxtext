@@ -98,10 +98,18 @@ class KascadeAnchorAttention(nn.Module):
     def __call__(self, x, mask=None, freq_cis=None):
         batch, seq_len, _ = x.shape
         
+        # DEBUG: Check input dtype
+        if DEBUG_MODE:
+            print(f"   ANCHOR input dtype: {x.dtype}")
+        
         # 1. Standard Dense Projections (Q, K, V)
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         k = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         v = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
+        
+        # DEBUG: Check projection output dtypes
+        if DEBUG_MODE:
+            print(f"   ANCHOR after Dense: q={q.dtype}, k={k.dtype}, v={v.dtype}")
         
         q = q.reshape(batch, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch, seq_len, self.num_heads, self.head_dim)
@@ -242,10 +250,18 @@ class KascadeReuseAttention(nn.Module):
     def __call__(self, x, mask=None, freq_cis=None):
         batch, seq_len, _ = x.shape
         
+        # DEBUG: Check input dtype
+        if DEBUG_MODE:
+            print(f"   REUSE input dtype: {x.dtype}")
+        
         # 1. Projections
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         k = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         v = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
+        
+        # DEBUG: Check projection output dtypes
+        if DEBUG_MODE:
+            print(f"   REUSE after Dense: q={q.dtype}, k={k.dtype}, v={v.dtype}")
         
         q = q.reshape(batch, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch, seq_len, self.num_heads, self.head_dim)

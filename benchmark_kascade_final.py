@@ -225,6 +225,9 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
     
     emb_data = load_embeddings(weights_dir)
     
+    # Check dtype of loaded weights
+    print(f"🔍 Weight dtypes: embed_tokens={emb_data['embed_tokens'].dtype}, norm={emb_data['norm'].dtype}")
+    
     params = {
         'tok_embeddings': {'embedding': emb_data['embed_tokens']},
         'norm': {'scale': emb_data['norm']},
@@ -233,6 +236,10 @@ def load_all_weights(weights_dir=WEIGHTS_DIR):
     
     for i in range(emb_data['config']['num_hidden_layers']):
         layer_weights = load_layer_params(i, weights_dir)
+        if i == 0:
+            # Print first layer dtypes
+            print(f"   Layer 0 dtypes: q_proj={layer_weights['attention']['q_proj']['kernel'].dtype}, "
+                  f"k_proj={layer_weights['attention']['k_proj']['kernel'].dtype}")
         
         wq = layer_weights['attention']['q_proj']['kernel']
         wk = layer_weights['attention']['k_proj']['kernel']
