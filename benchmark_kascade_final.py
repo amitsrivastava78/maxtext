@@ -309,32 +309,37 @@ class LlamaBlock(nn.Module):
         # Compute attention based on plan type
         if plan["type"] == "DENSE":
             # TRUE full attention - no tile selection, no sparsity
-            # Use standard multi-head attention (not Kascade)
-            q = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_0")(normed)
-            k = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_1")(normed)
-            v = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_2")(normed)
+            # Create module scope to match weight structure (KascadeAnchorAttention_0)
+            class DenseFullAttention(nn.Module):
+                @nn.compact
+                def __call__(self, x, freq_cis):
+                    batch, seq_len, _ = x.shape
+                    q = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_0")(x)
+                    k = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_1")(x)
+                    v = nn.Dense(NUM_HEADS * HEAD_DIM, use_bias=False, name="Dense_2")(x)
+                    
+                    q = q.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
+                    k = k.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
+                    v = v.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
+                    
+                    # Apply RoPE
+                    q_t = jnp.transpose(q, (0, 2, 1, 3))
+                    k_t = jnp.transpose(k, (0, 2, 1, 3))
+                    q_t, k_t = apply_rope(q_t, k_t, freq_cis)
+                    q = jnp.transpose(q_t, (0, 2, 1, 3))
+                    k = jnp.transpose(k_t, (0, 2, 1, 3))
+                    
+                    # Standard full attention
+                    logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(HEAD_DIM)
+                    mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+                    logits = jnp.where(mask[None, None, :, :], logits, -1e10)
+                    weights = jax.nn.softmax(logits, axis=-1)
+                    
+                    output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
+                    output = output.reshape(batch, seq_len, NUM_HEADS * HEAD_DIM)
+                    return nn.Dense(EMBED_DIM, use_bias=False, name="Dense_3")(output)
             
-            batch, seq_len, _ = normed.shape
-            q = q.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
-            k = k.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
-            v = v.reshape(batch, seq_len, NUM_HEADS, HEAD_DIM)
-            
-            # Apply RoPE
-            q_t = jnp.transpose(q, (0, 2, 1, 3))
-            k_t = jnp.transpose(k, (0, 2, 1, 3))
-            q_t, k_t = apply_rope(q_t, k_t, freq_cis)
-            q = jnp.transpose(q_t, (0, 2, 1, 3))
-            k = jnp.transpose(k_t, (0, 2, 1, 3))
-            
-            # Standard full attention
-            logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(HEAD_DIM)
-            mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-            logits = jnp.where(mask[None, None, :, :], logits, -1e10)
-            weights = jax.nn.softmax(logits, axis=-1)
-            
-            output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
-            output = output.reshape(batch, seq_len, NUM_HEADS * HEAD_DIM)
-            attn_out = nn.Dense(EMBED_DIM, use_bias=False, name="Dense_3")(output)
+            attn_out = DenseFullAttention(name="KascadeAnchorAttention_0")(normed, freq_cis)
         elif plan["type"] == "ANCHOR":
             attn = KascadeAnchorAttention(
                 NUM_HEADS, HEAD_DIM, self.layer_id,
