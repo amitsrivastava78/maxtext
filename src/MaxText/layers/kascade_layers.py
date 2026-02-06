@@ -264,35 +264,42 @@ class KascadeAnchorAttention(nn.Module):
         # as dense) and additionally determine which tiles are important.
         # The tile indices are cached for REUSE layers to borrow.
         # Only REUSE layers do sparse attention (that's where speedup comes from).
+        #
+        # Memory strategy: compute tile scores FIRST with rep-query method (128MB),
+        # then compute full attention for output (2GB). They don't coexist in memory.
+        # This avoids the 8GB peak from reshaping the full [B,H,S,S] weights tensor.
         
         num_tiles = seq_len // self.tile_size
         actual_top_k = min(self.top_k_tiles, num_tiles)
         
-        # --- FULL ATTENTION OUTPUT (same as DenseFullAttention) ---
-        logits = jnp.einsum('bqhd,bkhd->bhqk', q, k) / jnp.sqrt(self.head_dim)
-        if mask is None:
-            mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        logits = jnp.where(mask[None, None, :, :], logits, -1e10)
-        weights = jax.nn.softmax(logits, axis=-1)
-        output = jnp.einsum('bhqk,bkhd->bqhd', weights, v)
-        output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
-        output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        # Transpose to [B, H, S, D] for attention
+        q_bh = jnp.transpose(q, (0, 2, 1, 3))
+        k_bh = jnp.transpose(k, (0, 2, 1, 3))
+        v_bh = jnp.transpose(v, (0, 2, 1, 3))
         
-        # --- TILE SCORING (from full attention weights, no extra memory) ---
-        # We already have the full attention weights [B, H, Q, K].
-        # Pool them into tile scores for caching.
-        # Reshape to tile groups: [B, H, Qg, tile_size, num_tiles, tile_size]
-        weights_tiled = weights.reshape(
-            batch, self.num_heads, num_tiles, self.tile_size, num_tiles, self.tile_size)
-        # Max-pool over tile_size dimensions to get [B, H, Qg, num_tiles]
-        tile_scores = jnp.max(weights_tiled, axis=(3, 5))  # [B, H, Qg, num_tiles]
+        # --- STEP 1: TILE SCORING with representative queries (128MB) ---
+        # Done BEFORE full attention so they don't compete for memory.
+        rep_pos = jnp.arange(self.tile_size - 1, seq_len, self.tile_size)  # [Qg]
+        q_reps = q_bh[:, :, rep_pos, :]  # [B, H, Qg, D]
         
-        # Top-K per tile-group
+        rep_logits = jnp.einsum('bhgd,bhsd->bhgs', q_reps, k_bh) / jnp.sqrt(self.head_dim)
+        
+        # Causal mask for reps
+        rep_positions = rep_pos[None, None, :, None]
+        all_positions = jnp.arange(seq_len)[None, None, None, :]
+        rep_logits = jnp.where(all_positions <= rep_positions, rep_logits, -1e10)
+        
+        rep_weights = jax.nn.softmax(rep_logits, axis=-1)  # [B, H, Qg, S]
+        
+        # Max-pool over tile_size to get tile scores [B, H, Qg, num_tiles]
+        rep_weights_tiled = rep_weights.reshape(
+            batch, self.num_heads, num_tiles, num_tiles, self.tile_size)
+        tile_scores = jnp.max(rep_weights_tiled, axis=-1)  # [B, H, Qg, num_tiles]
+        
         _, group_tile_indices = jax.lax.top_k(tile_scores, actual_top_k)
         # [B, H, Qg, top_k]
         
-        # --- SAVE TO CACHE for REUSE layers ---
-        # Expand to per-query shape for REUSE layer compatibility
+        # Cache indices for REUSE layers
         top_tile_indices = jnp.repeat(group_tile_indices, self.tile_size, axis=2)
         last_token_indices = group_tile_indices[:, :, -1, :]  # [B, H, top_k]
         cache_key = f"layer_{self.layer_id}_indices"
@@ -303,6 +310,19 @@ class KascadeAnchorAttention(nn.Module):
             def print_anchor(idx):
                 print(f"  [Anchor L{self.layer_id}] Top-{actual_top_k} Tiles (Head 0): {idx[0,0]}")
             jax.debug.callback(print_anchor, last_token_indices)
+        
+        # --- STEP 2: FULL ATTENTION OUTPUT (same as DenseFullAttention) ---
+        # rep_weights is small (128MB) and will be freed by XLA.
+        # Full attention uses the same 2GB as the dense baseline.
+        logits = jnp.einsum('bhqd,bhkd->bhqk', q_bh, k_bh) / jnp.sqrt(self.head_dim)
+        if mask is None:
+            mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        logits = jnp.where(mask[None, None, :, :], logits, -1e10)
+        weights = jax.nn.softmax(logits, axis=-1)
+        output = jnp.einsum('bhqk,bhkd->bhqd', weights, v_bh)
+        output = jnp.transpose(output, (0, 2, 1, 3))
+        output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
+        output = nn.Dense(x.shape[-1], use_bias=False)(output)
         
         # Debug: track output stats
         if DEBUG_MODE:
