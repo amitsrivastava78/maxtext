@@ -186,6 +186,14 @@ def kascade_attention_forward(
     if block_sizes is None:
         block_sizes = KascadeBlockSizes()
     
+    # TPU Pallas only supports bfloat16 and float32, not float16
+    # Store original dtype to convert back at the end
+    original_dtype = q.dtype
+    if original_dtype == jnp.float16:
+        q = q.astype(jnp.bfloat16)
+        k_sparse = k_sparse.astype(jnp.bfloat16)
+        v_sparse = v_sparse.astype(jnp.bfloat16)
+    
     num_heads, q_seq_len, head_dim_qk = q.shape
     _, sparse_len, head_dim_v = v_sparse.shape
     
@@ -272,6 +280,10 @@ def kascade_attention_forward(
         scratch_shapes=scratch_shapes,
         grid=grid,
     )(q, k_sparse, v_sparse)
+    
+    # Convert back to original dtype if needed
+    if original_dtype == jnp.float16:
+        output = output.astype(original_dtype)
     
     return output
 
