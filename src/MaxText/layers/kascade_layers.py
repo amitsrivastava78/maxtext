@@ -261,7 +261,13 @@ class KascadeReuseAttention(nn.Module):
 
         # 2. Retrieve Anchor Indices
         cache_key = f"layer_{self.anchor_layer_id}_indices"
-        anchor_indices = KASCADE_CACHE.get(cache_key, jnp.zeros((batch, self.num_heads, 2), dtype=jnp.int32))
+        anchor_indices = KASCADE_CACHE.get(cache_key, None)
+        
+        if anchor_indices is None:
+            raise RuntimeError(
+                f"REUSE Layer {self.anchor_layer_id} cache miss! "
+                f"Anchor layer {self.anchor_layer_id} must run before REUSE layer can access its indices."
+            )
         
         # 3. Apply Head Mapping
         if self.head_map is not None:
