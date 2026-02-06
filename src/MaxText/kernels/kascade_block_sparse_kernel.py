@@ -122,23 +122,24 @@ def _block_mask_to_2d_union(block_mask, tile_size):
     
     Args:
         block_mask: [B, H, Qg, Kg] boolean
-        tile_size: block size (must match SplashConfig block sizes, typically 128)
+        tile_size: block size (Kascade tile size, typically 128)
     Returns:
         mask_2d: [q_seq, kv_seq] boolean (jax.Array)
     """
     # Union across heads and batch: if ANY head in ANY batch needs the block, keep it
     union_mask = jnp.any(block_mask, axis=(0, 1))  # [Qg, Kg]
     
-    # Expand blocks to tokens: each True block becomes a tile_size x tile_size True region
-    # union_mask[qi, ki] = True means tokens [qi*ts : (qi+1)*ts] attend to [ki*ts : (ki+1)*ts]
+    # Apply causal constraint at block level first (cheap: [Qg, Kg])
     Qg, Kg = union_mask.shape
-    # Repeat each block entry tile_size times along both axes
-    mask_2d = jnp.repeat(jnp.repeat(union_mask, tile_size, axis=0), tile_size, axis=1)
+    block_causal = jnp.tril(jnp.ones((Qg, Kg), dtype=jnp.bool_))
+    union_mask = union_mask & block_causal
     
-    # Also apply causal constraint at token level
+    # Expand to token level with fused causal masking.
+    # Creates only ONE S×S output (avoids double-materializing S×S arrays).
     seq_len = Qg * tile_size
-    causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-    mask_2d = mask_2d & causal
+    row_idx = jnp.arange(seq_len)[:, None]  # [S, 1]
+    col_idx = jnp.arange(seq_len)[None, :]  # [1, S]
+    mask_2d = union_mask[row_idx // tile_size, col_idx // tile_size] & (row_idx >= col_idx)
     
     return mask_2d
 
@@ -165,14 +166,32 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
         return block_sparse_attention_jax(q, k, v, block_mask, tile_size)
     
     # --- Tokamax SplashAttention path ---
+    
+    # Cast to bf16: reduces HBM for Q/K/V (~768MB → ~384MB at 32K)
+    orig_dtype = q.dtype
+    q = q.astype(jnp.bfloat16)
+    k = k.astype(jnp.bfloat16)
+    v = v.astype(jnp.bfloat16)
+    
     # 1. Create union 2D mask (single mask across heads)
     mask_2d = _block_mask_to_2d_union(block_mask, tile_size)  # [S, S] bool
     
-    # 2. Build SplashAttention kernel with dynamic grid
+    # 2. Choose SplashAttention block sizes to fit in TPU SMEM (1MB limit).
+    #    SMEM holds schedule arrays: ~21 bytes per (q_block, kv_block) pair.
+    #    At tile_size=128, seq_len=32K: 256² pairs → 1.31MB > 1MB (OOM!).
+    #    Doubling to splash_block=256: 128² pairs → 337KB ✓.
+    #    block_kv_compute stays 128 to match TPU MXU hardware tile size.
+    num_tiles_sq = (S // tile_size) ** 2
+    smem_estimate = 21 * num_tiles_sq
+    if smem_estimate > 900_000:  # ~880KB threshold, leave margin for 1MB SMEM
+        splash_block = tile_size * 2  # 128 → 256
+    else:
+        splash_block = tile_size
+    
     config = _tokamax_SplashConfig(
-        block_q=tile_size,
-        block_kv=tile_size,
-        block_kv_compute=tile_size,
+        block_q=splash_block,
+        block_kv=splash_block,
+        block_kv_compute=min(splash_block, 128),
     )
     
     # make_dynamic_splash_mha returns a SplashAttentionKernel
@@ -193,6 +212,7 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
         outputs.append(out_b)
     
     output = jnp.stack(outputs, axis=0)  # [B, H, S, D]
+    output = output.astype(orig_dtype)  # Cast back to original dtype
     return output
 
 
