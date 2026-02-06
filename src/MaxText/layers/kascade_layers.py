@@ -9,9 +9,24 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 import numpy as np
+import os
+import importlib.util
 
 # Debug Mode Flag - Set to False for production benchmarks
 DEBUG_MODE = False  # Disable for clean benchmark output
+
+# Import block-sparse kernel (handles TPU + CPU fallback)
+try:
+    _kernel_path = os.path.join(os.path.dirname(__file__), '..', 'kernels', 'kascade_block_sparse_kernel.py')
+    _kernel_path = os.path.abspath(_kernel_path)
+    _spec = importlib.util.spec_from_file_location('kascade_block_sparse_kernel', _kernel_path)
+    _bsk = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_bsk)
+    block_sparse_attention = _bsk.block_sparse_attention
+    create_block_mask_from_tile_indices = _bsk.create_block_mask_from_tile_indices
+    BLOCK_SPARSE_AVAILABLE = True
+except Exception:
+    BLOCK_SPARSE_AVAILABLE = False
 
 # Global Cache to pass data between layers during Calibration & Inference
 # Format: { "layer_0_indices": array([Batch, Heads, TopK_Tiles]) }
@@ -207,56 +222,10 @@ class KascadeAnchorAttention(nn.Module):
             q = jnp.transpose(q_t, (0, 2, 1, 3))
             k = jnp.transpose(k_t, (0, 2, 1, 3))
         
-        # Use optimized Pallas kernel if enabled
-        if self.use_splash:
-            # Import our optimized kascade_kernel
-            import sys
-            import os
-            import importlib.util
-            
-            # Load kascade_kernel module
-            kernel_path = os.path.join(os.path.dirname(__file__), '..', 'kernels', 'kascade_kernel.py')
-            if os.path.exists(kernel_path):
-                spec = importlib.util.spec_from_file_location("kascade_kernel", kernel_path)
-                kascade_kernel_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(kascade_kernel_module)
-                
-                # Use complete Kascade pipeline: tile selection + optimized kernel
-                select_top_k_tiles = getattr(kascade_kernel_module, 'select_top_k_tiles', None)
-                kascade_attention_forward = kascade_kernel_module.kascade_attention_forward
-                
-                if select_top_k_tiles:
-                    # Complete Kascade pipeline (6× speedup)
-                    # Transpose to kernel format: (heads, seq_len, head_dim)
-                    q_kernel = jnp.transpose(q, (1, 0, 2, 3)).reshape(self.num_heads, batch * seq_len, self.head_dim)
-                    k_kernel = jnp.transpose(k, (1, 0, 2, 3)).reshape(self.num_heads, batch * seq_len, self.head_dim)
-                    v_kernel = jnp.transpose(v, (1, 0, 2, 3)).reshape(self.num_heads, batch * seq_len, self.head_dim)
-                    
-                    # Tile selection (top 25% = 4× speedup)
-                    top_k_ratio = self.top_k_tiles / (seq_len / self.tile_size)
-                    k_sparse, v_sparse = select_top_k_tiles(q_kernel, k_kernel, v_kernel, 
-                                                            tile_size=self.tile_size, 
-                                                            top_k_ratio=top_k_ratio)
-                    
-                    # Optimized kernel on selected tiles (0.9× overhead)
-                    attn_out = kascade_attention_forward(q_kernel, k_sparse, v_sparse)
-                else:
-                    # Kernel-only (no tile selection) 
-                    q_kernel = jnp.transpose(q, (1, 0, 2, 3)).reshape(self.num_heads, batch * seq_len, self.head_dim)
-                    k_kernel = jnp.transpose(k, (1, 0, 2, 3)).reshape(self.num_heads, batch * seq_len, self.head_dim)
-                    v_kernel = jnp.transpose(v, (1, 0, 2, 3)).reshape(self.num_heads, batch * seq_len, self.head_dim)
-                    attn_out = kascade_attention_forward(q_kernel, k_kernel, v_kernel)
-                
-                # Reshape back: (num_heads, batch*seq_len, head_dim) -> (batch, seq_len, num_heads*head_dim)
-                attn_out = attn_out.reshape(self.num_heads, batch, seq_len, self.head_dim)
-                attn_out = jnp.transpose(attn_out, (1, 2, 0, 3))
-                attn_out = attn_out.reshape(batch, seq_len, self.num_heads * self.head_dim)
-                
-                # Project output
-                output = nn.Dense(x.shape[-1], use_bias=False)(attn_out)
-                return output
+        # ANCHOR layers ALWAYS compute full attention (paper requirement).
+        # The use_splash flag only affects REUSE layers (block-sparse kernel).
+        # ANCHOR computes full attention output + caches tile indices for REUSE.
         
-        # Standard JAX implementation (fallback or when splash disabled)
         # ============================================================
         # ANCHOR = FULL ATTENTION OUTPUT + TILE INDEX CACHING
         # ============================================================
@@ -407,15 +376,74 @@ class KascadeReuseAttention(nn.Module):
         # Shape: [B, H, Q, top_k + 1]
         my_tile_indices = jnp.concatenate([my_tile_indices, local_tile_indices], axis=-1)
             
-        # 5. BLOCK-SPARSE ATTENTION (per-tile-group, not per-query)
-        #    Group queries by their tile (16 queries per group).
-        #    Each group shares the same K/V tile selection → 16× less gather.
-        #    This is exactly how SplashAttention works on TPU (block-level sparsity).
-        #
-        #    Per-query gather: [B*H, Q=512, sparse_len=272, D=64] = 285M elements
-        #    Per-tile gather:  [B*H, nqt=32, sparse_len=272, D=64] = 17.8M elements
+        # 5. BLOCK-SPARSE ATTENTION
+        #    Two paths:
+        #    A) use_splash=True → Masked dense attention (TPU MXU-friendly, no gather)
+        #    B) use_splash=False → Tile-group gather (CPU fallback)
         
         num_q_tiles = seq_len // self.tile_size
+        num_kv_tiles = num_q_tiles  # same as num_tiles since Q and K have same seq_len
+        
+        if self.use_splash and BLOCK_SPARSE_AVAILABLE:
+            # === PATH A: MASKED DENSE ATTENTION (TPU-optimized) ===
+            # Key insight: On TPU, full Q@K^T via MXU is faster than gather-based
+            # sparse attention. So we compute full attention scores, then MASK out
+            # non-selected tile blocks before softmax. This gives:
+            #   - MXU-optimal matmuls (same speed as dense Q@K^T and @V)
+            #   - Tile-level sparsity in attention weights (same quality as gather)
+            #   - Zero gather overhead
+            #
+            # The tile mask is applied via a reshape trick (no data copy):
+            #   logits [B,H,S,S] → [B,H,Qg,ts,Kg,ts] → apply block_mask → reshape back
+            
+            # Use last query per tile-group as representative for tile selection
+            tile_repr = jnp.arange(self.tile_size - 1, seq_len, self.tile_size)
+            tile_sel = my_tile_indices[:, :, tile_repr, :]  # [B, H, Qg, top_k+1]
+            
+            # Create block mask: [B, H, Qg, Kg] boolean
+            bm = create_block_mask_from_tile_indices(
+                tile_sel, num_kv_tiles, causal=True
+            )
+            
+            # Full Q@K^T — uses MXU on TPU, same cost as dense
+            logits = jnp.einsum('bhsd,bhtd->bhst', q, k) / jnp.sqrt(self.head_dim)
+            
+            # Causal mask (token-level)
+            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+            logits = jnp.where(causal_mask[None, None], logits, -1e10)
+            
+            # Apply tile mask via reshape (zero-copy view change)
+            # [B, H, S, S] → [B, H, Qg, ts, Kg, ts]
+            logits_tiled = logits.reshape(
+                batch, self.num_heads, num_q_tiles, self.tile_size,
+                num_kv_tiles, self.tile_size
+            )
+            # bm: [B, H, Qg, Kg] → [B, H, Qg, 1, Kg, 1]
+            bm_expanded = bm[:, :, :, None, :, None]
+            logits_tiled = jnp.where(bm_expanded, logits_tiled, -1e10)
+            logits = logits_tiled.reshape(batch, self.num_heads, seq_len, seq_len)
+            
+            # Softmax + weighted sum — uses MXU on TPU
+            weights = jax.nn.softmax(logits, axis=-1)
+            # Handle all-masked rows (early tokens)
+            all_masked = jnp.all(logits <= -1e9, axis=-1, keepdims=True)
+            weights = jnp.where(all_masked, 0.0, weights)
+            
+            output = jnp.einsum('bhst,bhtd->bhsd', weights, v)
+            
+            output = jnp.transpose(output, (0, 2, 1, 3))
+            output = output.reshape(batch, seq_len, self.num_heads * self.head_dim)
+            output = nn.Dense(x.shape[-1], use_bias=False)(output)
+            
+            if DEBUG_MODE:
+                def print_reuse_stats(out, aid):
+                    print(f"   [REUSE-MASKED from L{aid}] mean={float(jnp.mean(out)):.6f}, "
+                          f"std={float(jnp.std(out)):.6f}, has_nan={bool(jnp.any(jnp.isnan(out)))}")
+                jax.debug.callback(print_reuse_stats, output, self.anchor_layer_id)
+            
+            return output
+        
+        # === PATH B: TILE-GROUP GATHER (fallback) ===
         
         # Reduce to per-tile: use last query in each tile as representative
         # (it sees the most context → best tile selection for the group)

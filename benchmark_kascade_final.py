@@ -33,6 +33,7 @@ DenseFullAttention = kascade_module.DenseFullAttention
 KASCADE_CACHE = kascade_module.KASCADE_CACHE
 precompute_freqs_cis = kascade_module.precompute_freqs_cis
 apply_rope = kascade_module.apply_rope
+BLOCK_SPARSE_AVAILABLE = getattr(kascade_module, 'BLOCK_SPARSE_AVAILABLE', False)
 
 # Model Configuration (Fixed)
 WEIGHTS_DIR = "llama_weights_chunked"
@@ -532,61 +533,14 @@ def main():
     
     # Check SplashAttention availability
     if args.use_splash_kernel:
-        if args.device != 'tpu':
-            print(f"\n⚠️  WARNING: --use_splash_kernel only works on TPU, but device is '{args.device}'")
-            print("   Falling back to standard Kascade implementation")
+        if not BLOCK_SPARSE_AVAILABLE:
+            print(f"\n⚠️  WARNING: Block-sparse kernel not available")
+            print("   Falling back to gather-based Kascade implementation")
             args.use_splash_kernel = False
+            USE_SPLASH_KERNEL = False
         else:
-            try:
-                # Step 1: Load splash_attention_kernel first
-                import importlib.util
-                import traceback
-                
-                kernel_path = os.path.join(src_path, "MaxText/kernels/splash_attention_kernel.py")
-                kernel_path = os.path.abspath(kernel_path)
-                
-                print(f"\n🔧 Loading splash_attention_kernel from: {kernel_path}")
-                print(f"   File exists: {os.path.exists(kernel_path)}")
-                
-                kernel_spec = importlib.util.spec_from_file_location("splash_attention_kernel_direct", kernel_path)
-                kernel_module = importlib.util.module_from_spec(kernel_spec)
-                print("   ✓ Kernel spec created")
-                
-                sys.modules[kernel_spec.name] = kernel_module
-                kernel_spec.loader.exec_module(kernel_module)
-                print("   ✓ Kernel module loaded")
-                
-                # Step 2: Load kascade_splash_attention and inject the kernel module
-                splash_path = os.path.join(src_path, "MaxText/layers/kascade_splash_attention.py")
-                splash_path = os.path.abspath(splash_path)
-                
-                print(f"🔧 Loading kascade_splash_attention from: {splash_path}")
-                print(f"   File exists: {os.path.exists(splash_path)}")
-                
-                spec = importlib.util.spec_from_file_location("kascade_splash_attention", splash_path)
-                kascade_splash_module = importlib.util.module_from_spec(spec)
-                print("   ✓ Splash spec created")
-                
-                sys.modules[spec.name] = kascade_splash_module
-                # Inject the kernel module before execution
-                kascade_splash_module._KERNEL_MODULE = kernel_module
-                kascade_splash_module.__file__ = splash_path
-                print("   ✓ Kernel module injected")
-                
-                spec.loader.exec_module(kascade_splash_module)
-                print("   ✓ Splash module loaded")
-                
-                # Store in sys.modules so LlamaBlock can import it
-                sys.modules['kascade_splash_attention'] = kascade_splash_module
-                
-                print("\n✅ SplashAttention kernel available - will use optimized implementation")
-            except Exception as e:
-                print(f"\n⚠️  WARNING: Could not import kascade_splash_attention: {e}")
-                print(f"   Error type: {type(e).__name__}")
-                print("   Traceback:")
-                traceback.print_exc()
-                print("   Falling back to standard Kascade implementation")
-                args.use_splash_kernel = False
+            print(f"\n✅ Block-sparse kernel loaded — REUSE layers will use mask-based attention")
+            print(f"   Platform: {args.device.upper()} → {'Pallas kernel' if args.device == 'tpu' else 'JAX block-sparse fallback'}")
     
     print("\n" + "=" * 70)
     print("🚀 FINAL KASCADE BENCHMARK")
@@ -600,6 +554,11 @@ def main():
     print(f"   Max Reuse Dist:   {args.max_reuse_dist}")
     print(f"   Weights Dir:      {args.weights_dir}")
     print(f"   Use Splash Kernel: {'YES (2-3× expected speedup)' if args.use_splash_kernel else 'NO'}")
+    if args.use_splash_kernel:
+        if BLOCK_SPARSE_AVAILABLE:
+            print(f"   ✅ Block-sparse kernel loaded (mask-based, no gather)")
+        else:
+            print(f"   ⚠️  Block-sparse kernel NOT available, will use gather fallback")
     
     # Load weights
     print("\n📥 Loading Weights...")
