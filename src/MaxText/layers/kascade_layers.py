@@ -276,19 +276,6 @@ class KascadeReuseAttention(nn.Module):
                 jax.debug.callback(print_map, perm_indices)
         else:
             my_tile_indices = anchor_indices
-
-        # --- FIX 1: FORCE LOCAL ATTENTION ---
-        # We assume the "current" tile is the last one in the sequence.
-        # Calc current tile index: (seq_len - 1) // tile_size
-        current_tile_idx = (seq_len - 1) // self.tile_size
-        
-        # We append this index to our list of indices to ensure we look at neighbors
-        # (For simplicity in JAX static shapes, we replace the LAST fetched tile with the Local Tile)
-        # In a real dynamic kernel, we would append +1 size.
-        
-        # Overwrite the last slot of top-k with the current tile index
-        # shape: [Batch, Heads, TopK]
-        my_tile_indices = my_tile_indices.at[:, :, -1].set(current_tile_idx)
             
         # 4. Expand to Tokens (Gather Logic)
         offsets = jnp.arange(self.tile_size)[None, None, None, :]
