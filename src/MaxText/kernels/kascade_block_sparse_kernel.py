@@ -152,6 +152,78 @@ def _block_mask_to_2d_union(block_mask, tile_size):
     return mask_2d
 
 
+# ============================================================
+# Cache for compiled splash kernels (avoid per-layer recompilation)
+# ============================================================
+_FULL_CAUSAL_SPLASH_CACHE = {}
+_SPARSE_SPLASH_CACHE = {}
+
+
+def full_causal_splash_attention(q, k, v):
+    """Dense causal attention via Tokamax SplashAttention (flash attention on TPU).
+    
+    Replacement for jax.nn.dot_product_attention which is broken on TPU in
+    JAX 0.9.0.1 (produces random outputs regardless of implementation param).
+    Uses a full lower-triangular causal mask (all blocks active = standard attention).
+    
+    The kernel is cached by seq_len so compilation happens only once.
+    
+    Args:
+        q, k, v: [B, H, S, D]
+    Returns:
+        output: [B, H, S, D]
+    """
+    if not TOKAMAX_SPLASH_AVAILABLE:
+        raise RuntimeError("Tokamax not available for full_causal_splash_attention")
+    
+    B, H, S, D = q.shape
+    
+    # Choose splash block size
+    splash_block = 256
+    if S < splash_block:
+        splash_block = max(64, S)
+    if S % splash_block != 0:
+        for sb in [256, 128, 64]:
+            if S % sb == 0:
+                splash_block = sb
+                break
+    
+    cache_key = ('full_causal', S, splash_block)
+    if cache_key not in _FULL_CAUSAL_SPLASH_CACHE:
+        # Build full causal mask on CPU to avoid TPU HBM pressure
+        num_blocks = S // splash_block
+        block_mask_np = np.tril(np.ones((num_blocks, num_blocks), dtype=np.bool_))
+        mask_np = np.repeat(np.repeat(block_mask_np, splash_block, axis=0),
+                            splash_block, axis=1)
+        mask_np = np.tril(mask_np)  # Token-level causal within diagonal blocks
+        mask_2d = jax.device_put(jnp.array(mask_np))
+        del mask_np, block_mask_np
+        
+        config = _tokamax_SplashConfig(
+            block_q=splash_block,
+            block_kv=splash_block,
+            block_kv_compute=min(splash_block, 128),
+        )
+        kernel = _tokamax_make_dynamic_splash_mha(mask=mask_2d, config=config)
+        _FULL_CAUSAL_SPLASH_CACHE[cache_key] = kernel
+        del mask_2d
+    
+    kernel = _FULL_CAUSAL_SPLASH_CACHE[cache_key]
+    
+    orig_dtype = q.dtype
+    q = q.astype(jnp.bfloat16)
+    k = k.astype(jnp.bfloat16)
+    v = v.astype(jnp.bfloat16)
+    
+    outputs = []
+    for b in range(B):
+        out_b = kernel(q[b], k[b], v[b])
+        outputs.append(out_b)
+    
+    output = jnp.stack(outputs, axis=0).astype(orig_dtype)
+    return output
+
+
 def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     """Sparse attention via Tokamax SplashAttention with dynamic grid.
     
@@ -181,32 +253,37 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     k = k.astype(jnp.bfloat16)
     v = v.astype(jnp.bfloat16)
     
-    # 1. Create union 2D mask (single mask across heads)
-    mask_2d = _block_mask_to_2d_union(block_mask, tile_size)  # [S, S] bool
+    # 1. Check cache: hash the union mask to avoid recompiling the kernel
+    union_mask = jnp.any(block_mask, axis=(0, 1))  # [Qg, Kg]
+    union_np = np.asarray(union_mask)
+    cache_key = ('sparse', S, tile_size, hash(union_np.tobytes()))
     
-    # 2. Choose SplashAttention block sizes to fit in TPU SMEM (1MB limit).
-    #    SMEM holds schedule arrays: ~21 bytes per (q_block, kv_block) pair.
-    #    At tile_size=128, seq_len=32K: 256² pairs → 1.31MB > 1MB (OOM!).
-    #    Doubling to splash_block=256: 128² pairs → 337KB ✓.
-    #    block_kv_compute stays 128 to match TPU MXU hardware tile size.
-    num_tiles_sq = (S // tile_size) ** 2
-    smem_estimate = 21 * num_tiles_sq
-    if smem_estimate > 900_000:  # ~880KB threshold, leave margin for 1MB SMEM
-        splash_block = tile_size * 2  # 128 → 256
+    if cache_key in _SPARSE_SPLASH_CACHE:
+        splash_kernel = _SPARSE_SPLASH_CACHE[cache_key]
     else:
-        splash_block = tile_size
-    
-    config = _tokamax_SplashConfig(
-        block_q=splash_block,
-        block_kv=splash_block,
-        block_kv_compute=min(splash_block, 128),
-    )
-    
-    # make_dynamic_splash_mha returns a SplashAttentionKernel
-    splash_kernel = _tokamax_make_dynamic_splash_mha(
-        mask=mask_2d.astype(jnp.bool_),
-        config=config,
-    )
+        # Build token-level mask on CPU (only on cache miss)
+        mask_2d = _block_mask_to_2d_union(block_mask, tile_size)  # [S, S] bool
+        
+        # Choose SplashAttention block sizes to fit in TPU SMEM (1MB limit)
+        num_tiles_sq = (S // tile_size) ** 2
+        smem_estimate = 21 * num_tiles_sq
+        if smem_estimate > 900_000:
+            splash_block = tile_size * 2  # 128 → 256
+        else:
+            splash_block = tile_size
+        
+        config = _tokamax_SplashConfig(
+            block_q=splash_block,
+            block_kv=splash_block,
+            block_kv_compute=min(splash_block, 128),
+        )
+        
+        splash_kernel = _tokamax_make_dynamic_splash_mha(
+            mask=mask_2d.astype(jnp.bool_),
+            config=config,
+        )
+        _SPARSE_SPLASH_CACHE[cache_key] = splash_kernel
+        del mask_2d
     
     # 3. Call kernel for each batch element
     # SplashAttention expects: q=[num_heads, seq_len, head_dim], k/v same
@@ -244,6 +321,7 @@ __all__ = [
     'block_sparse_attention',
     'block_sparse_attention_jax',
     'splash_sparse_attention',
+    'full_causal_splash_attention',
     'create_block_mask_from_tile_indices',
     'TOKAMAX_SPLASH_AVAILABLE',
 ]

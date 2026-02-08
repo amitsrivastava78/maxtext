@@ -38,10 +38,12 @@ try:
     block_sparse_attention = _bsk.block_sparse_attention
     create_block_mask_from_tile_indices = _bsk.create_block_mask_from_tile_indices
     splash_sparse_attention = getattr(_bsk, 'splash_sparse_attention', None)
+    full_causal_splash_attention = getattr(_bsk, 'full_causal_splash_attention', None)
     BLOCK_SPARSE_AVAILABLE = True
 except Exception as e:
     BLOCK_SPARSE_AVAILABLE = False
     splash_sparse_attention = None
+    full_causal_splash_attention = None
 
 # Global Cache
 KASCADE_CACHE = {}
@@ -110,10 +112,10 @@ def apply_rope(xq, xk, freqs_cis):
 def memory_efficient_causal_attention(q, k, v):
     """Causal attention dispatcher.
     
-    On TPU: Uses jax.nn.dot_product_attention (O(1) memory, no S*S matrix).
-    On CPU/GPU: Uses explicit Q@K^T (jax.nn.dot_product_attention is buggy on CPU in JAX 0.9.0).
-    
-    For CPU with seq_len > ~8192, this will OOM. Use chunked/tiled approach instead.
+    On TPU: Uses Tokamax SplashAttention (flash attention, O(S) memory).
+           jax.nn.dot_product_attention is broken on TPU in JAX 0.9.0.1
+           (produces random outputs → PPL ≈ vocab_size for all implementation options).
+    On CPU/GPU: Uses explicit Q@K^T.
     
     Args:
         q, k, v: [B, H, S, D]
@@ -122,14 +124,11 @@ def memory_efficient_causal_attention(q, k, v):
     """
     platform = jax.devices()[0].platform
     if platform == 'tpu':
-        # Do NOT specify implementation='xla' -- broken in JAX 0.9.0.1
-        # (returns unblended attention, PPL ≈ vocab_size = random)
-        # Let JAX auto-detect the best flash attention implementation.
-        output = jax.nn.dot_product_attention(
-            q, k, v,
-            is_causal=True,
-        )
-        return output
+        # PRIMARY: Tokamax SplashAttention with full causal mask (cached kernel)
+        if full_causal_splash_attention is not None:
+            return full_causal_splash_attention(q, k, v)
+        # FALLBACK: Chunked explicit attention (correct, but no flash speedup)
+        return tpu_chunked_causal_attention(q, k, v)
     else:
         # CPU/GPU: explicit attention (works correctly)
         return explicit_causal_attention(q, k, v)
@@ -144,6 +143,36 @@ def explicit_causal_attention(q, k, v):
     weights = jax.nn.softmax(logits, axis=-1)
     output = jnp.einsum('bhqk,bhkd->bhqd', weights, v)
     return output
+
+
+def tpu_chunked_causal_attention(q, k, v, chunk_size=256):
+    """Chunked causal attention for TPU (fallback when Tokamax unavailable).
+    
+    Processes Q in chunks via lax.scan to avoid O(S²) memory.
+    Peak memory: O(H × chunk_size × S) per step.
+    """
+    B, H, S, D = q.shape
+    if S <= chunk_size:
+        return explicit_causal_attention(q, k, v)
+    num_chunks = S // chunk_size
+    scale = 1.0 / jnp.sqrt(jnp.float32(D))
+    
+    q_chunks = q.reshape(B, H, num_chunks, chunk_size, D)
+    q_scan = jnp.moveaxis(q_chunks, 2, 0)  # [nc, B, H, cs, D]
+    
+    def body(carry, xs):
+        idx, q_c = xs
+        logits = jnp.einsum('bhqd,bhkd->bhqk', q_c, k) * scale
+        q_pos = idx * chunk_size + jnp.arange(chunk_size)
+        k_pos = jnp.arange(S)
+        mask = q_pos[:, None] >= k_pos[None, :]
+        logits = jnp.where(mask[None, None], logits, -1e10)
+        weights = jax.nn.softmax(logits, axis=-1)
+        out = jnp.einsum('bhqk,bhkd->bhqd', weights, v)
+        return carry, out
+    
+    _, chunks_out = jax.lax.scan(body, None, (jnp.arange(num_chunks), q_scan))
+    return jnp.moveaxis(chunks_out, 0, 2).reshape(B, H, S, D)
 
 
 # ============================================================
