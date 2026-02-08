@@ -211,7 +211,10 @@ def full_causal_splash_attention(q, k, v):
     kernel = _FULL_CAUSAL_SPLASH_CACHE[cache_key]
     
     orig_dtype = q.dtype
-    q = q.astype(jnp.bfloat16)
+    # SplashAttention computes raw Q@K^T (no 1/sqrt(D) scaling internally).
+    # Pre-scale Q so logits = (Q/sqrt(D)) @ K^T = Q@K^T / sqrt(D).
+    scale = jnp.float32(D) ** -0.5
+    q = (q * scale).astype(jnp.bfloat16)
     k = k.astype(jnp.bfloat16)
     v = v.astype(jnp.bfloat16)
     
@@ -249,7 +252,10 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     
     # Cast to bf16: reduces HBM for Q/K/V (~768MB → ~384MB at 32K)
     orig_dtype = q.dtype
-    q = q.astype(jnp.bfloat16)
+    # SplashAttention computes raw Q@K^T (no 1/sqrt(D) scaling internally).
+    # Pre-scale Q so logits = (Q/sqrt(D)) @ K^T = Q@K^T / sqrt(D).
+    scale = jnp.float32(D) ** -0.5
+    q = (q * scale).astype(jnp.bfloat16)
     k = k.astype(jnp.bfloat16)
     v = v.astype(jnp.bfloat16)
     
