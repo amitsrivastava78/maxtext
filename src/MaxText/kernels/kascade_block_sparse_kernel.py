@@ -308,6 +308,89 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
 
 
 # ============================================================
+# Pre-warm Kernels (eliminate compilation during timing)
+# ============================================================
+
+def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32):
+    """Pre-build Tokamax kernels for each REUSE layer's block_mask.
+    
+    Replicates the exact mask transformation that KascadeReuseAttention applies:
+    head permutation + diagonal local_mask + union across heads + hash.
+    This ensures cache_key matches at runtime → zero recompilation during timing.
+    
+    Args:
+        kascade_cache: The KASCADE_CACHE dict with block_masks from anchor layers
+        schedule: Layer schedule dict with head_map for REUSE layers
+        tile_size: Block tile size (128 for 32K)
+        num_heads: Number of attention heads (32 for LLaMA 3.2-1B)
+    """
+    if not TOKAMAX_SPLASH_AVAILABLE:
+        print("   Prewarm skipped: Tokamax not available")
+        return
+    
+    prewarmed = 0
+    already_cached = 0
+    for layer_id in sorted(schedule.keys()):
+        plan = schedule[layer_id]
+        if plan["type"] != "REUSE":
+            continue
+        
+        anchor_id = plan["anchor_id"]
+        block_mask = kascade_cache.get(f"layer_{anchor_id}_block_mask")
+        if block_mask is None:
+            print(f"   Prewarm L{layer_id}: no block_mask for anchor L{anchor_id}")
+            continue
+        
+        # Replicate KascadeReuseAttention's mask transformation exactly
+        head_map = plan.get("head_map", {})
+        perm_list = [head_map.get(h, h) for h in range(num_heads)]
+        perm_indices = jnp.array(perm_list, dtype=jnp.int32)
+        bm = block_mask[:, perm_indices, :, :]
+        
+        num_tiles = block_mask.shape[2]
+        local_mask = jnp.eye(num_tiles, dtype=jnp.bool_)
+        bm = bm | local_mask[None, None, :, :]
+        
+        # Compute union + hash (same as splash_sparse_attention)
+        union_mask = jnp.any(bm, axis=(0, 1))
+        union_np = np.asarray(union_mask)
+        S = num_tiles * tile_size
+        cache_key = ('sparse', S, tile_size, hash(union_np.tobytes()))
+        
+        if cache_key in _SPARSE_SPLASH_CACHE:
+            already_cached += 1
+            continue
+        
+        # Build token-level mask and compile kernel
+        mask_2d = _block_mask_to_2d_union(bm, tile_size)
+        
+        num_tiles_sq = num_tiles ** 2
+        smem_estimate = 21 * num_tiles_sq
+        splash_block = tile_size * 2 if smem_estimate > 900_000 else tile_size
+        
+        config = _tokamax_SplashConfig(
+            block_q=splash_block,
+            block_kv=splash_block,
+            block_kv_compute=min(splash_block, 128),
+        )
+        
+        kernel = _tokamax_make_dynamic_splash_mha(
+            mask=mask_2d.astype(jnp.bool_), config=config)
+        _SPARSE_SPLASH_CACHE[cache_key] = kernel
+        del mask_2d
+        prewarmed += 1
+        
+        # Report density
+        causal_mask_blk = jnp.tril(jnp.ones_like(union_mask, dtype=jnp.bool_))
+        causal_blocks = int(jnp.sum(causal_mask_blk))
+        active = int(jnp.sum(union_mask & causal_mask_blk))
+        skipped_pct = (1 - active / causal_blocks) * 100 if causal_blocks > 0 else 0
+        print(f"   L{layer_id} (anchor={anchor_id}): {skipped_pct:.0f}% blocks skipped, block={splash_block}")
+    
+    print(f"   Pre-warmed {prewarmed} new + {already_cached} cached REUSE kernels")
+
+
+# ============================================================
 # Main Entry Point
 # ============================================================
 
@@ -329,5 +412,6 @@ __all__ = [
     'splash_sparse_attention',
     'full_causal_splash_attention',
     'create_block_mask_from_tile_indices',
+    'prewarm_sparse_kernels',
     'TOKAMAX_SPLASH_AVAILABLE',
 ]

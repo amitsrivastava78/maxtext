@@ -45,6 +45,19 @@ except Exception as e:
     splash_sparse_attention = None
     full_causal_splash_attention = None
 
+# Expose kernel internals for benchmark pre-warming (same module instance
+# as splash_sparse_attention uses, so writes to cache are visible at runtime)
+if BLOCK_SPARSE_AVAILABLE:
+    prewarm_sparse_kernels = getattr(_bsk, 'prewarm_sparse_kernels', None)
+    _SPARSE_SPLASH_CACHE = _bsk._SPARSE_SPLASH_CACHE
+    _FULL_CAUSAL_SPLASH_CACHE = _bsk._FULL_CAUSAL_SPLASH_CACHE
+    TOKAMAX_SPLASH_AVAILABLE = getattr(_bsk, 'TOKAMAX_SPLASH_AVAILABLE', False)
+else:
+    prewarm_sparse_kernels = None
+    _SPARSE_SPLASH_CACHE = {}
+    _FULL_CAUSAL_SPLASH_CACHE = {}
+    TOKAMAX_SPLASH_AVAILABLE = False
+
 # Global Cache
 KASCADE_CACHE = {}
 

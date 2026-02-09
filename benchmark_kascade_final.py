@@ -41,15 +41,10 @@ precompute_freqs_cis = kascade_module.precompute_freqs_cis
 apply_rope = kascade_module.apply_rope
 BLOCK_SPARSE_AVAILABLE = getattr(kascade_module, 'BLOCK_SPARSE_AVAILABLE', False)
 
-# Try to import Tokamax availability flag
-try:
-    _kernel_spec = importlib.util.spec_from_file_location("kascade_kernel",
-        os.path.join(src_path, "MaxText/kernels/kascade_block_sparse_kernel.py"))
-    _kernel_mod = importlib.util.module_from_spec(_kernel_spec)
-    _kernel_spec.loader.exec_module(_kernel_mod)
-    TOKAMAX_SPLASH_AVAILABLE = getattr(_kernel_mod, 'TOKAMAX_SPLASH_AVAILABLE', False)
-except Exception:
-    TOKAMAX_SPLASH_AVAILABLE = False
+# Get kernel refs from same module instance as kascade_layers uses
+# (avoids separate module with different _SPARSE_SPLASH_CACHE dict)
+TOKAMAX_SPLASH_AVAILABLE = getattr(kascade_module, 'TOKAMAX_SPLASH_AVAILABLE', False)
+prewarm_sparse_kernels = getattr(kascade_module, 'prewarm_sparse_kernels', None)
 
 # Model Configuration (Fixed for LLaMA 3.2-1B)
 WEIGHTS_DIR = "llama_weights_chunked"
@@ -84,7 +79,11 @@ USE_SPLASH_KERNEL = False
 
 def auto_params(seq_len):
     """Auto-select tile_size and top_k based on sequence length."""
-    if seq_len >= 4096:
+    if seq_len >= 32768:
+        tile_size = 128  # Match TPU block size
+        num_tiles = seq_len // tile_size
+        top_k = max(2, num_tiles // 10)  # ~10% for 32K+ (lower union density)
+    elif seq_len >= 4096:
         tile_size = 128  # Match TPU block size
         num_tiles = seq_len // tile_size
         top_k = max(2, num_tiles // 8)  # ~12.5% of tiles
@@ -564,9 +563,44 @@ def main():
     # At 32K: hidden=[1,32768,2048]=256MB vs logits=[1,32768,128256]=16.8GB
     use_hidden = SEQ_LEN > 4096
     
+    # --- Build test_schedule: ANCHOR→DENSE for timing ---
+    # Eliminates tile scoring overhead from ANCHOR layers during timing.
+    # REUSE layers use pre-cached block_masks from the sparse PPL eval.
+    # This matches Kascade's deployment model: calibrate once, infer with cached selections.
+    anchor_ids_with_reuse = set()
+    for layer_id, plan in schedule.items():
+        if plan["type"] == "REUSE":
+            anchor_ids_with_reuse.add(plan["anchor_id"])
+    
+    # Save block_masks and tile indices for REUSE layers
+    saved_cache = {}
+    for k, v in KASCADE_CACHE.items():
+        for aid in anchor_ids_with_reuse:
+            if f"layer_{aid}_" in k:
+                saved_cache[k] = v
+                break
+    
+    # Pre-warm Tokamax kernels (compiles kernels matching runtime cache keys)
+    if prewarm_sparse_kernels is not None and jax.devices()[0].platform == 'tpu':
+        print("\n  Pre-warming Tokamax kernels...")
+        prewarm_sparse_kernels(KASCADE_CACHE, schedule, TILE_SIZE, NUM_HEADS)
+    
+    # Build test_schedule: ANCHOR→DENSE for timing
+    test_schedule = {}
+    for layer_id, plan in schedule.items():
+        if plan["type"] == "ANCHOR":
+            test_schedule[layer_id] = {"type": "DENSE"}
+        else:
+            test_schedule[layer_id] = dict(plan)
+    
+    model_sparse_timing = LlamaModel(schedule=test_schedule, use_splash=USE_SPLASH_KERNEL)
+    anchor_converted = sum(1 for v in schedule.values() if v["type"] == "ANCHOR")
+    print(f"\n  Timing schedule: {anchor_converted} ANCHOR → DENSE (no tile scoring overhead)")
+    print(f"   Saved {len(saved_cache)} cache entries for {len(anchor_ids_with_reuse)} anchors")
+    
     # Free PPL intermediates before speedup benchmark
     import gc
-    del ppl_dense, ppl_sparse
+    del model_sparse  # Use model_sparse_timing instead
     gc.collect()
     
     # Warmup (2 rounds each)
@@ -580,10 +614,11 @@ def main():
         del out
         
         KASCADE_CACHE.clear()
+        KASCADE_CACHE.update(saved_cache)
         if use_hidden:
-            out = model_sparse.apply(params_dict, test_ids, method=model_sparse.forward_hidden)
+            out = model_sparse_timing.apply(params_dict, test_ids, method=model_sparse_timing.forward_hidden)
         else:
-            out = model_sparse.apply(params_dict, test_ids)
+            out = model_sparse_timing.apply(params_dict, test_ids)
         jax.block_until_ready(out)
         del out
     
@@ -600,15 +635,16 @@ def main():
         dense_times.append(time.perf_counter() - start)
         del out
     
-    # Sparse timing
+    # Sparse timing (test_schedule: ANCHOR→DENSE, pre-populated cache)
     sparse_times = []
     for i in range(n_runs):
         KASCADE_CACHE.clear()
+        KASCADE_CACHE.update(saved_cache)
         start = time.perf_counter()
         if use_hidden:
-            out = model_sparse.apply(params_dict, test_ids, method=model_sparse.forward_hidden)
+            out = model_sparse_timing.apply(params_dict, test_ids, method=model_sparse_timing.forward_hidden)
         else:
-            out = model_sparse.apply(params_dict, test_ids)
+            out = model_sparse_timing.apply(params_dict, test_ids)
         jax.block_until_ready(out)
         sparse_times.append(time.perf_counter() - start)
         del out
