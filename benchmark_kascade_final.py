@@ -75,6 +75,7 @@ TILE_SIZE = 16
 TOP_K_OPTIMIZED = 8
 SEQ_LEN = DEFAULT_SEQ_LEN
 USE_SPLASH_KERNEL = False
+FORCE_SPARSE = False
 
 
 def auto_params(seq_len):
@@ -354,7 +355,8 @@ class LlamaBlock(nn.Module):
             attn = KascadeReuseAttention(
                 NUM_HEADS, HEAD_DIM, plan["anchor_id"],
                 tile_size=TILE_SIZE, head_map=plan["head_map"],
-                use_splash=self.use_splash and USE_SPLASH_KERNEL)
+                use_splash=self.use_splash and USE_SPLASH_KERNEL,
+                force_sparse=FORCE_SPARSE)
             attn_out = attn(normed, freq_cis=freq_cis)
         x = x + attn_out
         normed = nn.RMSNorm(epsilon=1e-5, name="ffn_norm")(x)
@@ -405,6 +407,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default=DEFAULT_DEVICE, choices=['cpu', 'tpu', 'gpu'])
     parser.add_argument("--use_splash_kernel", action="store_true", default=False,
         help="Use SplashAttention for REUSE (Tokamax on TPU, masked-dense on CPU for short seq)")
+    parser.add_argument("--force_sparse", action="store_true", default=False,
+        help="Disable profitability gates: run sparse even at short seq / high density (for reporting)")
     return parser.parse_args()
 
 
@@ -417,12 +421,13 @@ def main():
     print(f"  JAX: {len(devices)} {devices[0].platform.upper()} device(s)")
     
     # Auto-select tile_size and top_k
-    global TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN, USE_SPLASH_KERNEL
+    global TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN, USE_SPLASH_KERNEL, FORCE_SPARSE
     SEQ_LEN = args.seq_len
     auto_ts, auto_tk = auto_params(SEQ_LEN)
     TILE_SIZE = args.tile_size if args.tile_size is not None else auto_ts
     TOP_K_OPTIMIZED = args.top_k if args.top_k is not None else auto_tk
     USE_SPLASH_KERNEL = args.use_splash_kernel
+    FORCE_SPARSE = args.force_sparse
     
     # Ensure seq_len is divisible by tile_size
     if SEQ_LEN % TILE_SIZE != 0:
@@ -442,6 +447,8 @@ def main():
     print(f"   Top-K Tiles:  {TOP_K_OPTIMIZED}/{num_tiles} = {TOP_K_OPTIMIZED/num_tiles:.0%} ({'auto' if args.top_k is None else 'manual'})")
     print(f"   Threshold:    {args.threshold:.2%}")
     print(f"   Splash:       {'YES' if USE_SPLASH_KERNEL else 'NO'}")
+    if FORCE_SPARSE:
+        print(f"   Force Sparse: YES (profitability gates disabled)")
     if USE_SPLASH_KERNEL:
         print(f"   Tokamax:      {'Available' if TOKAMAX_SPLASH_AVAILABLE else 'Not installed (will use fallback)'}")
         if args.device == 'tpu' and TOKAMAX_SPLASH_AVAILABLE:
@@ -583,7 +590,7 @@ def main():
     # Pre-warm Tokamax kernels (compiles kernels matching runtime cache keys)
     if prewarm_sparse_kernels is not None and jax.devices()[0].platform == 'tpu':
         print("\n  Pre-warming Tokamax kernels...")
-        prewarm_sparse_kernels(KASCADE_CACHE, schedule, TILE_SIZE, NUM_HEADS)
+        prewarm_sparse_kernels(KASCADE_CACHE, schedule, TILE_SIZE, NUM_HEADS, FORCE_SPARSE)
     
     # Build test_schedule: ANCHOR→DENSE for timing
     test_schedule = {}

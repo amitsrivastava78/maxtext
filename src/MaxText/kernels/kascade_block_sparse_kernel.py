@@ -227,7 +227,7 @@ def full_causal_splash_attention(q, k, v):
     return output
 
 
-def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
+def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32, force_sparse=False):
     """Sparse attention via Tokamax SplashAttention with dynamic grid.
     
     On TPU: Uses make_dynamic_splash_mha for actual block skipping.
@@ -261,7 +261,7 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     # exceeds the savings from skipping blocks. Empirically determined
     # on TPU v2-8 with LLaMA 3.2-1B: 16K is 0.75× (slower), 32K is 1.15×.
     _MIN_PROFITABLE_SEQ = 20480  # ~20K
-    if S < _MIN_PROFITABLE_SEQ:
+    if S < _MIN_PROFITABLE_SEQ and not force_sparse:
         return full_causal_splash_attention(q, k, v)
     
     # --- Profitability gate 2: union mask density ---
@@ -278,7 +278,7 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     density = active / total_causal if total_causal > 0 else 1.0
     
     _MAX_PROFITABLE_DENSITY = 0.75
-    if density > _MAX_PROFITABLE_DENSITY:
+    if density > _MAX_PROFITABLE_DENSITY and not force_sparse:
         return full_causal_splash_attention(q, k, v)
     
     # --- Tokamax SplashAttention path (profitable sparse) ---
@@ -344,7 +344,7 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
 # Pre-warm Kernels (eliminate compilation during timing)
 # ============================================================
 
-def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32):
+def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32, force_sparse=False):
     """Pre-build Tokamax kernels for each REUSE layer's block_mask.
     
     Replicates the exact mask transformation that KascadeReuseAttention applies:
@@ -388,7 +388,7 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32)
         S = num_tiles * tile_size
         
         # --- Profitability gate 1: sequence length ---
-        if S < 20480:
+        if S < 20480 and not force_sparse:
             skipped_dense += 1
             continue
         
@@ -403,7 +403,7 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32)
         active = int(np.sum(union_np & block_causal_np))
         density = active / total_causal if total_causal > 0 else 1.0
         
-        if density > 0.75:
+        if density > 0.75 and not force_sparse:
             skipped_pct = (1 - density) * 100
             print(f"   L{layer_id} (anchor={anchor_id}): density {density:.0%} > 75% "
                   f"→ will use dense (only {skipped_pct:.0f}% blocks skippable)")
@@ -450,14 +450,14 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32)
 # Main Entry Point
 # ============================================================
 
-def block_sparse_attention(q, k, v, block_mask, tile_size=128, use_pallas=True):
+def block_sparse_attention(q, k, v, block_mask, tile_size=128, use_pallas=True, force_sparse=False):
     """Block-sparse attention — main entry point.
     
     Dispatches to Tokamax SplashAttention on TPU, JAX fallback on CPU/GPU.
     """
     if use_pallas and TOKAMAX_SPLASH_AVAILABLE and jax.devices()[0].platform == 'tpu':
         num_heads = q.shape[1]
-        return splash_sparse_attention(q, k, v, block_mask, tile_size, num_heads)
+        return splash_sparse_attention(q, k, v, block_mask, tile_size, num_heads, force_sparse)
     else:
         return block_sparse_attention_jax(q, k, v, block_mask, tile_size)
 

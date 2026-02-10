@@ -333,6 +333,7 @@ class KascadeReuseAttention(nn.Module):
     tile_size: int = 128
     head_map: dict = None
     use_splash: bool = False
+    force_sparse: bool = False
 
     @nn.compact
     def __call__(self, x, mask=None, freq_cis=None):
@@ -372,7 +373,7 @@ class KascadeReuseAttention(nn.Module):
             bm = anchor_mask[:, perm_indices, :, :]
             local_mask = jnp.eye(num_tiles, dtype=jnp.bool_)
             bm = bm | local_mask[None, None, :, :]
-            output = splash_sparse_attention(q, k, v, bm, self.tile_size, self.num_heads)
+            output = splash_sparse_attention(q, k, v, bm, self.tile_size, self.num_heads, self.force_sparse)
         
         # === PATH B: Masked dense (short sequences, any device) ===
         elif self.use_splash and anchor_mask is not None and seq_len <= 8192:
