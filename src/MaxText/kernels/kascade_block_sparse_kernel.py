@@ -233,6 +233,14 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     On TPU: Uses make_dynamic_splash_mha for actual block skipping.
     On CPU: Falls back to block_sparse_attention_jax.
     
+    Includes profitability gates:
+      1. Sequence length gate: below ~20K, dynamic grid scheduling overhead
+         exceeds block-skipping savings on TPU v2/v3.
+      2. Union density gate: when the OR of all heads' masks is too dense,
+         SplashAttention's per-block scheduling cost > compute savings.
+    When either gate triggers, falls back to full_causal_splash_attention
+    (dense flash attention, already compiled/cached, zero extra overhead).
+    
     Args:
         q, k, v: [B, H, S, D] — already RoPE'd
         block_mask: [B, H, Qg, Kg] boolean — from anchor's cached block mask
@@ -248,7 +256,32 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32):
     if platform != 'tpu' or not TOKAMAX_SPLASH_AVAILABLE:
         return block_sparse_attention_jax(q, k, v, block_mask, tile_size)
     
-    # --- Tokamax SplashAttention path ---
+    # --- Profitability gate 1: sequence length ---
+    # Below this threshold, dynamic grid scheduling overhead per-block
+    # exceeds the savings from skipping blocks. Empirically determined
+    # on TPU v2-8 with LLaMA 3.2-1B: 16K is 0.75× (slower), 32K is 1.15×.
+    _MIN_PROFITABLE_SEQ = 20480  # ~20K
+    if S < _MIN_PROFITABLE_SEQ:
+        return full_causal_splash_attention(q, k, v)
+    
+    # --- Profitability gate 2: union mask density ---
+    # Tokamax uses a single 2D mask shared across all heads.
+    # Union of H heads' masks: density = 1-(1-r)^H, much denser than per-head.
+    # When union density > threshold, sparse kernel is slower than dense.
+    union_mask = jnp.any(block_mask, axis=(0, 1))  # [Qg, Kg]
+    union_np = np.asarray(union_mask)  # sync barrier (also needed for cache key)
+    
+    Qg, Kg = union_np.shape
+    block_causal_np = np.tril(np.ones((Qg, Kg), dtype=np.bool_))
+    total_causal = int(np.sum(block_causal_np))
+    active = int(np.sum(union_np & block_causal_np))
+    density = active / total_causal if total_causal > 0 else 1.0
+    
+    _MAX_PROFITABLE_DENSITY = 0.75
+    if density > _MAX_PROFITABLE_DENSITY:
+        return full_causal_splash_attention(q, k, v)
+    
+    # --- Tokamax SplashAttention path (profitable sparse) ---
     
     # Cast to bf16: reduces HBM for Q/K/V (~768MB → ~384MB at 32K)
     orig_dtype = q.dtype
@@ -330,6 +363,7 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32)
     
     prewarmed = 0
     already_cached = 0
+    skipped_dense = 0
     for layer_id in sorted(schedule.keys()):
         plan = schedule[layer_id]
         if plan["type"] != "REUSE":
@@ -351,10 +385,31 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32)
         local_mask = jnp.eye(num_tiles, dtype=jnp.bool_)
         bm = bm | local_mask[None, None, :, :]
         
+        S = num_tiles * tile_size
+        
+        # --- Profitability gate 1: sequence length ---
+        if S < 20480:
+            skipped_dense += 1
+            continue
+        
         # Compute union + hash (same as splash_sparse_attention)
         union_mask = jnp.any(bm, axis=(0, 1))
         union_np = np.asarray(union_mask)
-        S = num_tiles * tile_size
+        
+        # --- Profitability gate 2: union density ---
+        Qg, Kg = union_np.shape
+        block_causal_np = np.tril(np.ones((Qg, Kg), dtype=np.bool_))
+        total_causal = int(np.sum(block_causal_np))
+        active = int(np.sum(union_np & block_causal_np))
+        density = active / total_causal if total_causal > 0 else 1.0
+        
+        if density > 0.75:
+            skipped_pct = (1 - density) * 100
+            print(f"   L{layer_id} (anchor={anchor_id}): density {density:.0%} > 75% "
+                  f"→ will use dense (only {skipped_pct:.0f}% blocks skippable)")
+            skipped_dense += 1
+            continue
+        
         cache_key = ('sparse', S, tile_size, hash(union_np.tobytes()))
         
         if cache_key in _SPARSE_SPLASH_CACHE:
@@ -387,7 +442,8 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32)
         skipped_pct = (1 - active / causal_blocks) * 100 if causal_blocks > 0 else 0
         print(f"   L{layer_id} (anchor={anchor_id}): {skipped_pct:.0f}% blocks skipped, block={splash_block}")
     
-    print(f"   Pre-warmed {prewarmed} new + {already_cached} cached REUSE kernels")
+    print(f"   Pre-warmed {prewarmed} new + {already_cached} cached REUSE kernels"
+          f" ({skipped_dense} layers → dense fallback)")
 
 
 # ============================================================
