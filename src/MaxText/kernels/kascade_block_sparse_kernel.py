@@ -282,6 +282,11 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32, fo
         return full_causal_splash_attention(q, k, v)
     
     # --- Tokamax SplashAttention path (profitable sparse) ---
+    # Debug: print density when force_sparse is active
+    if force_sparse:
+        import sys
+        print(f"  [SPARSE] Union density: {density:.1%}, skipping {(1-density)*100:.1f}% blocks",
+              file=sys.stderr, flush=True)
     
     # Cast to bf16: reduces HBM for Q/K/V (~768MB → ~384MB at 32K)
     orig_dtype = q.dtype
@@ -304,9 +309,10 @@ def splash_sparse_attention(q, k, v, block_mask, tile_size=128, num_heads=32, fo
         mask_2d = _block_mask_to_2d_union(block_mask, tile_size)  # [S, S] bool
         
         # Choose SplashAttention block sizes to fit in TPU SMEM (1MB limit)
+        # Use larger blocks (256) for seq >= 12K to reduce grid dispatch overhead
         num_tiles_sq = (S // tile_size) ** 2
         smem_estimate = 21 * num_tiles_sq
-        if smem_estimate > 900_000:
+        if smem_estimate > 200_000:  # ~11K seq_len threshold
             splash_block = tile_size * 2  # 128 → 256
         else:
             splash_block = tile_size
@@ -421,7 +427,7 @@ def prewarm_sparse_kernels(kascade_cache, schedule, tile_size=128, num_heads=32,
         
         num_tiles_sq = num_tiles ** 2
         smem_estimate = 21 * num_tiles_sq
-        splash_block = tile_size * 2 if smem_estimate > 900_000 else tile_size
+        splash_block = tile_size * 2 if smem_estimate > 200_000 else tile_size
         
         config = _tokamax_SplashConfig(
             block_q=splash_block,

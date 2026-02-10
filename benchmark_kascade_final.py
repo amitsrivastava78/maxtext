@@ -335,6 +335,7 @@ class LlamaBlock(nn.Module):
     layer_id: int = 0
     schedule: dict = None
     use_splash: bool = False
+    force_sparse: bool = False
     
     @nn.compact
     def __call__(self, x):
@@ -356,7 +357,7 @@ class LlamaBlock(nn.Module):
                 NUM_HEADS, HEAD_DIM, plan["anchor_id"],
                 tile_size=TILE_SIZE, head_map=plan["head_map"],
                 use_splash=self.use_splash and USE_SPLASH_KERNEL,
-                force_sparse=FORCE_SPARSE)
+                force_sparse=self.force_sparse)
             attn_out = attn(normed, freq_cis=freq_cis)
         x = x + attn_out
         normed = nn.RMSNorm(epsilon=1e-5, name="ffn_norm")(x)
@@ -369,6 +370,7 @@ class LlamaBlock(nn.Module):
 class LlamaModel(nn.Module):
     schedule: dict = None
     use_splash: bool = False
+    force_sparse: bool = False
     
     @nn.compact
     def __call__(self, input_ids):
@@ -387,7 +389,8 @@ class LlamaModel(nn.Module):
         x = nn.Embed(VOCAB_SIZE, EMBED_DIM, name="tok_embeddings")(input_ids)
         for i in range(NUM_LAYERS):
             x = LlamaBlock(layer_id=i, schedule=self.schedule,
-                          use_splash=self.use_splash, name=f"layer_{i}")(x)
+                          use_splash=self.use_splash, force_sparse=self.force_sparse,
+                          name=f"layer_{i}")(x)
         x = nn.RMSNorm(epsilon=1e-5, name="norm")(x)
         return x
 
@@ -504,11 +507,14 @@ def main():
         raise ValueError(f"Not enough tokens: {len(all_tokens)} < {3 * SEQ_LEN}")
     
     all_tokens = [min(t, VOCAB_SIZE - 1) for t in all_tokens]
-    skip = SEQ_LEN // 2
+    
+    # Use DISJOINT sequences for calibration vs test to avoid bias
+    # Calibration: first SEQ_LEN tokens
+    # Test: LAST SEQ_LEN tokens (maximum separation)
     calib_ids = jnp.array([all_tokens[:SEQ_LEN]], dtype=jnp.int32)
-    test_ids = jnp.array([all_tokens[SEQ_LEN+skip:2*SEQ_LEN+skip]], dtype=jnp.int32)
-    print(f"   Calibration: {calib_ids.shape[1]:,} tokens")
-    print(f"   Test:        {test_ids.shape[1]:,} tokens")
+    test_ids = jnp.array([all_tokens[-SEQ_LEN:]], dtype=jnp.int32)
+    print(f"   Calibration: {calib_ids.shape[1]:,} tokens (start of dataset)")
+    print(f"   Test:        {test_ids.shape[1]:,} tokens (end of dataset, ~{len(all_tokens)-SEQ_LEN:,} tokens apart)")
     
     # Calibrate
     schedule = calibrate_on_real_text_optimized(params_dict, calib_ids, args.threshold, args.max_reuse_dist)
@@ -531,7 +537,8 @@ def main():
     
     # Sparse Kascade
     print("\n  Running KASCADE Sparse...")
-    model_sparse = LlamaModel(schedule=schedule, use_splash=USE_SPLASH_KERNEL)
+    # Force sparse=True for PPL evaluation to bypass profitability gates and measure true sparse PPL
+    model_sparse = LlamaModel(schedule=schedule, use_splash=USE_SPLASH_KERNEL, force_sparse=True)
     KASCADE_CACHE.clear()
     
     if SEQ_LEN > 4096:
@@ -600,7 +607,8 @@ def main():
         else:
             test_schedule[layer_id] = dict(plan)
     
-    model_sparse_timing = LlamaModel(schedule=test_schedule, use_splash=USE_SPLASH_KERNEL)
+    # Use force_sparse for timing at all sequence lengths to measure true sparse performance
+    model_sparse_timing = LlamaModel(schedule=test_schedule, use_splash=USE_SPLASH_KERNEL, force_sparse=True)
     anchor_converted = sum(1 for v in schedule.values() if v["type"] == "ANCHOR")
     print(f"\n  Timing schedule: {anchor_converted} ANCHOR → DENSE (no tile scoring overhead)")
     print(f"   Saved {len(saved_cache)} cache entries for {len(anchor_ids_with_reuse)} anchors")
