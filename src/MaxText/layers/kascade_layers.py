@@ -45,6 +45,23 @@ except Exception as e:
     splash_sparse_attention = None
     full_causal_splash_attention = None
 
+# Import decode kernel (sparse KV-cache loading for autoregressive)
+try:
+    _decode_kernel_path = os.path.join(os.path.dirname(__file__), '..', 'kernels', 'kascade_decode_kernel.py')
+    _decode_kernel_path = os.path.abspath(_decode_kernel_path)
+    _dspec = importlib.util.spec_from_file_location('kascade_decode_kernel', _decode_kernel_path)
+    _dkm = importlib.util.module_from_spec(_dspec)
+    _dspec.loader.exec_module(_dkm)
+    kascade_sparse_decode = _dkm.kascade_sparse_decode
+    get_decode_tile_indices = _dkm.get_decode_tile_indices
+    dense_decode_attention_jax = _dkm.dense_decode_attention_jax
+    DECODE_KERNEL_AVAILABLE = True
+except Exception as e:
+    kascade_sparse_decode = None
+    get_decode_tile_indices = None
+    dense_decode_attention_jax = None
+    DECODE_KERNEL_AVAILABLE = False
+
 # Expose kernel internals for benchmark pre-warming (same module instance
 # as splash_sparse_attention uses, so writes to cache are visible at runtime)
 if BLOCK_SPARSE_AVAILABLE:
@@ -237,7 +254,35 @@ class DenseFullAttention(nn.Module):
     head_dim: int
 
     @nn.compact
-    def __call__(self, x, mask=None, freq_cis=None):
+    def __call__(self, x, mask=None, freq_cis=None,
+                 decode_mode=False, k_cache=None, v_cache=None,
+                 query_pos=None):
+        # === DECODE MODE: Dense attention over full KV cache ===
+        if decode_mode and k_cache is not None:
+            batch = x.shape[0]
+            q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
+            q = q.reshape(batch, 1, self.num_heads, self.head_dim)
+            q = jnp.transpose(q, (0, 2, 1, 3))  # [B, H, 1, D]
+            if freq_cis is not None:
+                k_dummy = jnp.zeros_like(q)
+                q, _ = apply_rope(q, k_dummy, freq_cis)
+            if dense_decode_attention_jax is not None:
+                output = dense_decode_attention_jax(
+                    q, k_cache, v_cache, query_pos=query_pos)
+            else:
+                S = k_cache.shape[2]
+                sm_scale = self.head_dim ** -0.5
+                scores = jnp.einsum('bhqd,bhkd->bhqk', q, k_cache) * sm_scale
+                qp = query_pos[:, None, None, None]
+                kv_pos = jnp.arange(S, dtype=jnp.int32)[None, None, None, :]
+                scores = jnp.where(kv_pos <= qp, scores, -1e10)
+                weights = jax.nn.softmax(scores, axis=-1)
+                output = jnp.einsum('bhqk,bhkd->bhqd', weights, v_cache)
+            output = jnp.transpose(output, (0, 2, 1, 3))
+            output = output.reshape(batch, 1, self.num_heads * self.head_dim)
+            output = nn.Dense(x.shape[-1], use_bias=False)(output)
+            return output
+        
         batch, seq_len, _ = x.shape
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         k = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
@@ -275,8 +320,100 @@ class KascadeAnchorAttention(nn.Module):
     tile_size: int = 128
     use_splash: bool = False
 
+    def _decode_forward(self, x, k_cache, v_cache, query_pos, freq_cis=None):
+        """Decode-mode forward for ANCHOR layer.
+        
+        During decode, ANCHOR layers use full attention over KV cache
+        (no sparsity — they are the "scout" layers that maintain quality).
+        Also updates tile scoring cache for subsequent REUSE layers.
+        
+        Args:
+            x: [B, 1, embed_dim]
+            k_cache: [B, H, S, D] full key cache
+            v_cache: [B, H, S, D] full value cache
+            query_pos: [B] int32
+            freq_cis: RoPE frequencies
+            
+        Returns:
+            output: [B, 1, embed_dim]
+        """
+        batch = x.shape[0]
+        S = k_cache.shape[2]
+        
+        # Project Q (K/V come from cache)
+        q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
+        q = q.reshape(batch, 1, self.num_heads, self.head_dim)
+        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, H, 1, D]
+        
+        if freq_cis is not None:
+            k_dummy = jnp.zeros_like(q)
+            q, _ = apply_rope(q, k_dummy, freq_cis)
+        
+        # Dense attention over full cache (ANCHOR = full attention for quality)
+        if dense_decode_attention_jax is not None:
+            output = dense_decode_attention_jax(
+                q, k_cache, v_cache, query_pos=query_pos
+            )  # [B, H, 1, D]
+        else:
+            # Fallback: manual dense decode
+            sm_scale = self.head_dim ** -0.5
+            scores = jnp.einsum('bhqd,bhkd->bhqk', q, k_cache) * sm_scale
+            qp = query_pos[:, None, None, None]
+            kv_pos = jnp.arange(S, dtype=jnp.int32)[None, None, None, :]
+            causal_mask = kv_pos <= qp
+            scores = jnp.where(causal_mask, scores, -1e10)
+            weights = jax.nn.softmax(scores, axis=-1)
+            output = jnp.einsum('bhqk,bhkd->bhqd', weights, v_cache)
+        
+        # Update tile scoring for REUSE layers during decode:
+        # Re-score tiles using the new query against the full KV cache
+        num_tiles = S // self.tile_size
+        actual_top_k = min(self.top_k_tiles, num_tiles)
+        
+        # Simple tile scoring for single decode query:
+        # Compute Q @ K_cache^T per tile and pick top-k
+        k_tiled = k_cache.reshape(batch, self.num_heads, num_tiles, self.tile_size, self.head_dim)
+        # Score = max attention to each tile
+        q_expanded = q[:, :, :, None, :]  # [B, H, 1, 1, D]
+        tile_scores = jnp.einsum('bhqtd,bhntd->bhqn', q_expanded, k_tiled)  # [B, H, 1, num_tiles]
+        tile_scores = tile_scores.squeeze(2)  # [B, H, num_tiles]
+        tile_scores = jnp.max(tile_scores, axis=-1, keepdims=False)  # max over tile_size
+        
+        # Actually we want [B, H, num_tiles] scores
+        tile_scores_full = jnp.einsum('bhd,bhntd->bhnt',
+                                       q.squeeze(2),  # [B, H, D]
+                                       k_tiled)        # [B, H, num_tiles, tile_size, D]
+        tile_scores_max = jnp.max(tile_scores_full, axis=-1)  # [B, H, num_tiles]
+        _, top_tile_indices = jax.lax.top_k(tile_scores_max, actual_top_k)  # [B, H, top_k]
+        
+        # Update cache with new selections (for REUSE decode steps)
+        # Store as [B, H, 1, top_k] to match prefill format [B, H, Qg, top_k]
+        # During decode, query_tile_idx determines which row to update
+        query_tile_idx = query_pos // self.tile_size
+        existing = KASCADE_CACHE.get(f"layer_{self.layer_id}_indices")
+        if existing is not None:
+            # Update the specific query tile's selections
+            B_cache, H_cache, Qg, topk = existing.shape
+            for b_idx in range(batch):
+                qt = int(query_tile_idx[b_idx])
+                if qt < Qg:
+                    existing = existing.at[b_idx, :, qt, :actual_top_k].set(
+                        top_tile_indices[b_idx, :, :actual_top_k])
+            KASCADE_CACHE[f"layer_{self.layer_id}_indices"] = existing
+        
+        output = jnp.transpose(output, (0, 2, 1, 3))  # [B, 1, H, D]
+        output = output.reshape(batch, 1, self.num_heads * self.head_dim)
+        output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        return output
+
     @nn.compact
-    def __call__(self, x, mask=None, freq_cis=None):
+    def __call__(self, x, mask=None, freq_cis=None,
+                 decode_mode=False, k_cache=None, v_cache=None,
+                 query_pos=None):
+        # === DECODE MODE: Full attention with cache + tile re-scoring ===
+        if decode_mode and k_cache is not None:
+            return self._decode_forward(x, k_cache, v_cache, query_pos, freq_cis)
+        
         batch, seq_len, _ = x.shape
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         k = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
@@ -323,9 +460,15 @@ class KascadeAnchorAttention(nn.Module):
 class KascadeReuseAttention(nn.Module):
     """Reuse (Worker) Layer: Sparse attention using anchor's tile selection.
     
-    PATH A (TPU with Tokamax): SplashAttention dynamic grid -> real block skipping
-    PATH B (short seq with splash): Masked dense via explicit S*S
-    PATH C (CPU fallback): Tile-group gather sparse attention
+    PREFILL MODE:
+      PATH A (TPU with Tokamax): SplashAttention dynamic grid -> real block skipping
+      PATH B (short seq with splash): Masked dense for short sequences
+      PATH C (CPU fallback): Tile-group gather sparse attention
+    
+    DECODE MODE:
+      PATH D: Sparse KV-cache loading — gathers only top-k tiles from cache,
+              reducing HBM bandwidth by ~90% (the decode bottleneck).
+              Expected speedup: 2-4× at 32K+ context.
     """
     num_heads: int
     head_dim: int
@@ -335,8 +478,75 @@ class KascadeReuseAttention(nn.Module):
     use_splash: bool = False
     force_sparse: bool = False
 
+    def _decode_forward(self, x, k_cache, v_cache, query_pos, freq_cis=None):
+        """Decode-mode forward: sparse KV-cache loading.
+        
+        Args:
+            x: [B, 1, embed_dim] — single new token embedding
+            k_cache: [B, H, S, D] — full key cache from all previous tokens
+            v_cache: [B, H, S, D] — full value cache from all previous tokens
+            query_pos: [B] int32 — position of the new token
+            freq_cis: RoPE frequencies
+            
+        Returns:
+            output: [B, 1, embed_dim]
+        """
+        batch = x.shape[0]
+        
+        # Project query only (K/V come from cache)
+        q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)  # [B, 1, H*D]
+        q = q.reshape(batch, 1, self.num_heads, self.head_dim)
+        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, H, 1, D]
+        
+        if freq_cis is not None:
+            # Apply RoPE to query only (cache K already has RoPE applied)
+            # Create a dummy k for apply_rope (won't be used)
+            k_dummy = jnp.zeros_like(q)
+            q, _ = apply_rope(q, k_dummy, freq_cis)
+        
+        # Get tile indices for this decode position
+        tile_indices = get_decode_tile_indices(
+            KASCADE_CACHE,
+            anchor_layer_id=self.anchor_layer_id,
+            query_pos=query_pos,
+            tile_size=self.tile_size,
+            head_map=self.head_map,
+            num_heads=self.num_heads,
+            add_local=True,
+            num_local_tiles=1,
+        )  # [B, H, top_k + 1]
+        
+        # Sparse decode: load only selected tiles from cache
+        output = kascade_sparse_decode(
+            q, k_cache, v_cache, tile_indices,
+            tile_size=self.tile_size,
+            query_pos=query_pos,
+        )  # [B, H, 1, D]
+        
+        output = jnp.transpose(output, (0, 2, 1, 3))  # [B, 1, H, D]
+        output = output.reshape(batch, 1, self.num_heads * self.head_dim)
+        output = nn.Dense(x.shape[-1], use_bias=False)(output)
+        
+        if DEBUG_MODE:
+            sparse_len = tile_indices.shape[2] * self.tile_size
+            full_len = k_cache.shape[2]
+            def print_decode_stats(out, sl, fl):
+                print(f"   [DECODE REUSE from L{self.anchor_layer_id}] "
+                      f"sparse_tokens={int(sl)}/{int(fl)} "
+                      f"({(1-int(sl)/int(fl))*100:.0f}% reduced) "
+                      f"mean={float(jnp.mean(out)):.6f}")
+            jax.debug.callback(print_decode_stats, output, sparse_len, full_len)
+        
+        return output
+
     @nn.compact
-    def __call__(self, x, mask=None, freq_cis=None):
+    def __call__(self, x, mask=None, freq_cis=None,
+                 decode_mode=False, k_cache=None, v_cache=None,
+                 query_pos=None):
+        # === PATH D: Decode mode (sparse KV-cache loading) ===
+        if decode_mode and DECODE_KERNEL_AVAILABLE and k_cache is not None:
+            return self._decode_forward(x, k_cache, v_cache, query_pos, freq_cis)
+        
         batch, seq_len, _ = x.shape
         q = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
         k = nn.Dense(self.num_heads * self.head_dim, use_bias=False)(x)
