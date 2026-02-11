@@ -859,12 +859,12 @@ def kascade_sparse_decode_scan(
 
 def _sparse_decode_kernel_v2(
     tile_indices_ref,   # [num_bh, top_k] int32 — scalar prefetch
-    q_ref,              # [D] — one query vector (batch dim squeezed by None BlockSpec)
+    q_ref,              # [1, D] — one query vector
     k_ref,              # [tile_size, D] — one K tile (loaded via BlockSpec DMA)
     v_ref,              # [tile_size, D] — one V tile (loaded via BlockSpec DMA)
-    o_ref,              # [D] — output accumulator
-    m_ref,              # [D] — running max (replicated across D for broadcast)
-    l_ref,              # [D] — running sum (replicated across D for broadcast)
+    o_ref,              # [1, D] — output accumulator
+    m_ref,              # [1, D] — running max (replicated across D for broadcast)
+    l_ref,              # [1, D] — running sum (replicated across D for broadcast)
     *,
     sm_scale: float,
     mask_value: float,
@@ -875,12 +875,15 @@ def _sparse_decode_kernel_v2(
     BlockSpec automatically loads the correct tile from HBM via contiguous DMA.
     Online softmax accumulates across tiles without materializing full scores.
 
+    All computation uses 2D tensors — Mosaic TPU cannot lower 1D→scalar
+    reductions (max, sum).  We keep q as [1, D], scores as [1, tile_size],
+    and reduce with axis + keepdims so shapes stay 2D throughout.
+
     Each grid iteration:
       1. K/V tile already in VMEM (loaded by BlockSpec from HBM)
-      2. scores = K_tile @ q (dot product per token in tile)
-      3. Online softmax update: m, l, o accumulators
+      2. scores = q @ K_tile^T → [1, tile_size]
+      3. Online softmax update: m, l, o accumulators (all [1, D])
     """
-    bh = pl.program_id(0)
     i = pl.program_id(1)   # which selected tile (0..top_k-1)
 
     @pl.when(i == 0)
@@ -890,27 +893,29 @@ def _sparse_decode_kernel_v2(
         o_ref[...] = jnp.zeros_like(o_ref)
 
     # Data already in VMEM thanks to BlockSpec
-    q = q_ref[...].astype(jnp.float32)     # [D]
+    # Keep everything 2D — Mosaic can't lower 1D→scalar reductions
+    q = q_ref[...].astype(jnp.float32)     # [1, D]
     k = k_ref[...].astype(jnp.float32)     # [tile_size, D]
     v = v_ref[...].astype(jnp.float32)     # [tile_size, D]
 
-    # Scores: K_tile @ q → [tile_size] (one score per token)
-    scores = jnp.dot(k, q) * sm_scale      # [tile_size]
+    # Scores: q @ K^T → [1, tile_size]  (2D matmul, Mosaic-friendly)
+    scores = (q @ k.T) * sm_scale          # [1, D]@[D, tile_size] → [1, tile_size]
 
-    # Online softmax — accumulate across tiles
-    m_prev = m_ref[...]                     # [D] (replicated scalar)
-    l_prev = l_ref[...]                     # [D] (replicated scalar)
+    # Online softmax — all ops stay 2D
+    m_prev = m_ref[...].astype(jnp.float32)  # [1, D]
+    l_prev = l_ref[...].astype(jnp.float32)  # [1, D]
 
-    m_curr = scores.max()                   # scalar
-    s = jnp.exp(scores - m_curr)            # [tile_size]
-    l_curr = s.sum()                        # scalar
+    # Tile-local max and sum — keepdims keeps shapes 2D
+    m_curr = jnp.max(scores, axis=-1, keepdims=True)   # [1, 1]
+    s = jnp.exp(scores - m_curr)                       # [1, tile_size]
+    l_curr = jnp.sum(s, axis=-1, keepdims=True)        # [1, 1]
 
-    # Weighted V: s @ V_tile → [D]
-    o_curr = jnp.dot(s, v)                  # [D]
+    # Weighted V: s @ V_tile → [1, D]  (2D matmul, Mosaic-friendly)
+    o_curr = s @ v                         # [1, tile_size]@[tile_size, D] → [1, D]
 
-    # Broadcast scalars to [D] for element-wise ops
-    m_curr_d = jnp.broadcast_to(m_curr, m_prev.shape)    # [D]
-    l_curr_d = jnp.broadcast_to(l_curr, l_prev.shape)    # [D]
+    # Broadcast [1, 1] → [1, D] for element-wise ops with accumulators
+    m_curr_d = jnp.broadcast_to(m_curr, m_prev.shape)  # [1, D]
+    l_curr_d = jnp.broadcast_to(l_curr, l_prev.shape)  # [1, D]
 
     m_next = jnp.maximum(m_prev, m_curr_d)
     alpha = jnp.exp(m_prev - m_next)        # rescale old accumulator
@@ -919,12 +924,12 @@ def _sparse_decode_kernel_v2(
     l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
 
     # Update output: weighted combination of old + new
-    o_prev = o_ref[...].astype(jnp.float32)
+    o_prev = o_ref[...].astype(jnp.float32)  # [1, D]
     o_next = (alpha * l_prev * o_prev + beta * o_curr) / l_next_safe
 
     o_ref[...] = o_next.astype(o_ref.dtype)
-    m_ref[...] = m_next
-    l_ref[...] = l_next_safe
+    m_ref[...] = m_next.astype(m_ref.dtype)
+    l_ref[...] = l_next_safe.astype(l_ref.dtype)
 
 
 def kascade_sparse_decode_pallas_v2(
@@ -974,24 +979,42 @@ def kascade_sparse_decode_pallas_v2(
 
     num_bh = B * H
 
+    # Pallas TPU requires the last dim to be divisible by 128 (or equal
+    # to the full array dim).  LLaMA-1B has D=64, so we pad to 128 and
+    # slice back after the kernel.
+    D_padded = max(D, 128)
+    need_pad = D_padded != D
+
     # Reshape: [B, H, ...] → [B*H, ...]
-    q_flat = q[:, :, 0, :].reshape(num_bh, D)       # [num_bh, D]
+    # q/o/m/l are 3D (num_bh, 1, D_padded) so the Squeezed batch dim is
+    # dim 0 — NOT one of the "last two" dims checked by Pallas TPU.
+    # The dummy seq dim of 1 == array_dim satisfies the alignment rule.
+    # KV are already 3D (num_bh, S, D_padded) — no issue.
+    q_flat = q[:, :, 0, :].reshape(num_bh, 1, D)    # [num_bh, 1, D]
     k_flat = k_cache.reshape(num_bh, S, D)           # [num_bh, S, D]
     v_flat = v_cache.reshape(num_bh, S, D)           # [num_bh, S, D]
     ti_flat = tile_indices.reshape(num_bh, top_k)    # [num_bh, top_k]
+
+    if need_pad:
+        pad_d = D_padded - D
+        q_flat = jnp.pad(q_flat, ((0, 0), (0, 0), (0, pad_d)))        # [num_bh, 1, D_padded]
+        k_flat = jnp.pad(k_flat, ((0, 0), (0, 0), (0, pad_d)))        # [num_bh, S, D_padded]
+        v_flat = jnp.pad(v_flat, ((0, 0), (0, 0), (0, pad_d)))        # [num_bh, S, D_padded]
+    else:
+        q_flat = q_flat  # already (num_bh, 1, D_padded)
 
     grid = (num_bh, top_k)
 
     # Index maps: scalar prefetch (tile_indices) is the last arg
     def q_index_map(bh, i, _ti_ref):
-        return (bh, 0)
+        return (bh, 0, 0)
 
     def kv_index_map(bh, i, ti_ref):
         tile_idx = ti_ref[bh, i]
         return (bh, tile_idx, 0)
 
     def o_index_map(bh, i, _ti_ref):
-        return (bh, 0)
+        return (bh, 0, 0)
 
     result = pl.pallas_call(
         functools.partial(
@@ -1002,14 +1025,14 @@ def kascade_sparse_decode_pallas_v2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[
-                pl.BlockSpec((None, D), q_index_map),              # q: [D]
-                pl.BlockSpec((None, tile_size, D), kv_index_map),  # k: [tile_size, D]
-                pl.BlockSpec((None, tile_size, D), kv_index_map),  # v: [tile_size, D]
+                pl.BlockSpec((None, 1, D_padded), q_index_map),            # q: [1, D_padded]
+                pl.BlockSpec((None, tile_size, D_padded), kv_index_map),    # k: [tile_size, D_padded]
+                pl.BlockSpec((None, tile_size, D_padded), kv_index_map),    # v: [tile_size, D_padded]
             ],
             out_specs=[
-                pl.BlockSpec((None, D), o_index_map),  # o: [D]
-                pl.BlockSpec((None, D), o_index_map),  # m: [D]
-                pl.BlockSpec((None, D), o_index_map),  # l: [D]
+                pl.BlockSpec((None, 1, D_padded), o_index_map),  # o: [1, D_padded]
+                pl.BlockSpec((None, 1, D_padded), o_index_map),  # m: [1, D_padded]
+                pl.BlockSpec((None, 1, D_padded), o_index_map),  # l: [1, D_padded]
             ],
             grid=grid,
         ),
@@ -1017,13 +1040,15 @@ def kascade_sparse_decode_pallas_v2(
             dimension_semantics=("parallel", "arbitrary"),
         ),
         out_shape=[
-            jax.ShapeDtypeStruct((num_bh, D), jnp.float32),  # o
-            jax.ShapeDtypeStruct((num_bh, D), jnp.float32),  # m
-            jax.ShapeDtypeStruct((num_bh, D), jnp.float32),  # l
+            jax.ShapeDtypeStruct((num_bh, 1, D_padded), jnp.float32),  # o
+            jax.ShapeDtypeStruct((num_bh, 1, D_padded), jnp.float32),  # m
+            jax.ShapeDtypeStruct((num_bh, 1, D_padded), jnp.float32),  # l
         ],
     )(ti_flat, q_flat, k_flat, v_flat)
 
-    output = result[0]  # [num_bh, D]
+    output = result[0][:, 0, :]  # [num_bh, D_padded] → squeeze seq dim
+    if need_pad:
+        output = output[:, :D]   # strip D padding
     output = output.reshape(B, H, 1, D).astype(q.dtype)
     return output
 
@@ -1112,8 +1137,13 @@ def kascade_sparse_decode(
     # Auto-dispatch based on device
     platform = jax.devices()[0].platform
     if platform == 'tpu':
-        # Tiled gather: 25 tile-block gathers (16KB each) vs 3200 row gathers.
-        # Dramatically fewer DMA operations = less per-operation overhead.
+        if PALLAS_AVAILABLE:
+            # Pallas BlockSpec DMA: contiguous tile loads from HBM→VMEM
+            # with online softmax — near-peak bandwidth.
+            return kascade_sparse_decode_pallas_v2(
+                q, k_cache, v_cache, tile_indices, tile_size, query_pos, sm_scale
+            )
+        # Fallback: tiled gather (25 tile-block gathers via JAX indexing)
         return kascade_sparse_decode_tiled(
             q, k_cache, v_cache, tile_indices, tile_size, query_pos, sm_scale
         )

@@ -55,11 +55,17 @@ try:
     kascade_sparse_decode = _dkm.kascade_sparse_decode
     get_decode_tile_indices = _dkm.get_decode_tile_indices
     dense_decode_attention_jax = _dkm.dense_decode_attention_jax
+    build_hot_kv_buffer = _dkm.build_hot_kv_buffer
+    kascade_sparse_decode_hotbuf = _dkm.kascade_sparse_decode_hotbuf
+    kascade_sparse_decode_pallas_v2 = getattr(_dkm, 'kascade_sparse_decode_pallas_v2', None)
     DECODE_KERNEL_AVAILABLE = True
 except Exception as e:
     kascade_sparse_decode = None
     get_decode_tile_indices = None
     dense_decode_attention_jax = None
+    build_hot_kv_buffer = None
+    kascade_sparse_decode_hotbuf = None
+    kascade_sparse_decode_pallas_v2 = None
     DECODE_KERNEL_AVAILABLE = False
 
 # Expose kernel internals for benchmark pre-warming (same module instance
@@ -401,6 +407,24 @@ class KascadeAnchorAttention(nn.Module):
                         top_tile_indices[b_idx, :, :actual_top_k])
             KASCADE_CACHE[f"layer_{self.layer_id}_indices"] = existing
         
+        # Build hot KV buffers for downstream REUSE layers.
+        # These are CONTIGUOUS in memory, so REUSE decode achieves
+        # near-peak HBM bandwidth (no gather overhead).
+        if build_hot_kv_buffer is not None:
+            # Include local tile around query position
+            local_tile = jnp.clip(query_tile_idx, 0, num_tiles - 1)
+            local_tiles_bh = jnp.broadcast_to(
+                local_tile[:, None, None], (batch, self.num_heads, 1)
+            ).astype(jnp.int32)
+            hot_tile_indices = jnp.concatenate(
+                [top_tile_indices, local_tiles_bh], axis=-1
+            )  # [B, H, top_k + 1]
+            hot_k, hot_v = build_hot_kv_buffer(
+                k_cache, v_cache, hot_tile_indices, self.tile_size
+            )
+            KASCADE_CACHE[f"layer_{self.layer_id}_hot_k"] = hot_k
+            KASCADE_CACHE[f"layer_{self.layer_id}_hot_v"] = hot_v
+        
         output = jnp.transpose(output, (0, 2, 1, 3))  # [B, 1, H, D]
         output = output.reshape(batch, 1, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
@@ -479,7 +503,14 @@ class KascadeReuseAttention(nn.Module):
     force_sparse: bool = False
 
     def _decode_forward(self, x, k_cache, v_cache, query_pos, freq_cis=None):
-        """Decode-mode forward: sparse KV-cache loading.
+        """Decode-mode forward: hot buffer sparse attention.
+        
+        Uses pre-built contiguous KV buffer from the ANCHOR layer.
+        Dense attention on this small buffer achieves near-peak HBM
+        bandwidth on TPU (no gather overhead).
+        
+        If hot buffers aren't available yet, falls back to dense
+        attention over the full KV cache (safe but slow).
         
         Args:
             x: [B, 1, embed_dim] — single new token embedding
@@ -499,43 +530,47 @@ class KascadeReuseAttention(nn.Module):
         q = jnp.transpose(q, (0, 2, 1, 3))  # [B, H, 1, D]
         
         if freq_cis is not None:
-            # Apply RoPE to query only (cache K already has RoPE applied)
-            # Create a dummy k for apply_rope (won't be used)
             k_dummy = jnp.zeros_like(q)
             q, _ = apply_rope(q, k_dummy, freq_cis)
         
-        # Get tile indices for this decode position
-        tile_indices = get_decode_tile_indices(
-            KASCADE_CACHE,
-            anchor_layer_id=self.anchor_layer_id,
-            query_pos=query_pos,
-            tile_size=self.tile_size,
-            head_map=self.head_map,
-            num_heads=self.num_heads,
-            add_local=True,
-            num_local_tiles=1,
-        )  # [B, H, top_k + 1]
+        # Hot buffer from ANCHOR layer (contiguous, near-peak bandwidth)
+        hot_k = KASCADE_CACHE.get(f"layer_{self.anchor_layer_id}_hot_k")
+        hot_v = KASCADE_CACHE.get(f"layer_{self.anchor_layer_id}_hot_v")
         
-        # Sparse decode: load only selected tiles from cache
-        output = kascade_sparse_decode(
-            q, k_cache, v_cache, tile_indices,
-            tile_size=self.tile_size,
-            query_pos=query_pos,
-        )  # [B, H, 1, D]
+        if hot_k is not None and hot_v is not None and kascade_sparse_decode_hotbuf is not None:
+            # Dense attention on pre-gathered contiguous buffer
+            output = kascade_sparse_decode_hotbuf(q, hot_k, hot_v)  # [B, H, 1, D]
+            
+            if DEBUG_MODE:
+                sparse_len = hot_k.shape[2]
+                full_len = k_cache.shape[2]
+                def print_hotbuf_stats(out, sl, fl):
+                    print(f"   [DECODE REUSE from L{self.anchor_layer_id}] "
+                          f"HOT BUFFER sparse_tokens={int(sl)}/{int(fl)} "
+                          f"({(1-int(sl)/int(fl))*100:.0f}% reduced) "
+                          f"mean={float(jnp.mean(out)):.6f}")
+                jax.debug.callback(print_hotbuf_stats, output, sparse_len, full_len)
+        else:
+            # Fallback: dense attention over full KV cache
+            # (hot buffers not built yet — ANCHOR hasn't run in decode mode)
+            S = k_cache.shape[2]
+            sm_scale = self.head_dim ** -0.5
+            scores = jnp.einsum('bhqd,bhkd->bhqk', q, k_cache) * sm_scale
+            qp = query_pos[:, None, None, None]
+            kv_pos = jnp.arange(S, dtype=jnp.int32)[None, None, None, :]
+            scores = jnp.where(kv_pos <= qp, scores, -1e10)
+            weights = jax.nn.softmax(scores, axis=-1)
+            output = jnp.einsum('bhqk,bhkd->bhqd', weights, v_cache)
+            
+            if DEBUG_MODE:
+                def print_fallback(out):
+                    print(f"   [DECODE REUSE from L{self.anchor_layer_id}] "
+                          f"FALLBACK dense (no hot buffer available)")
+                jax.debug.callback(print_fallback, output)
         
         output = jnp.transpose(output, (0, 2, 1, 3))  # [B, 1, H, D]
         output = output.reshape(batch, 1, self.num_heads * self.head_dim)
         output = nn.Dense(x.shape[-1], use_bias=False)(output)
-        
-        if DEBUG_MODE:
-            sparse_len = tile_indices.shape[2] * self.tile_size
-            full_len = k_cache.shape[2]
-            def print_decode_stats(out, sl, fl):
-                print(f"   [DECODE REUSE from L{self.anchor_layer_id}] "
-                      f"sparse_tokens={int(sl)}/{int(fl)} "
-                      f"({(1-int(sl)/int(fl))*100:.0f}% reduced) "
-                      f"mean={float(jnp.mean(out)):.6f}")
-            jax.debug.callback(print_decode_stats, output, sparse_len, full_len)
         
         return output
 
