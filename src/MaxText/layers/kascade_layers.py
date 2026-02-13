@@ -57,6 +57,9 @@ try:
     dense_decode_attention_jax = _dkm.dense_decode_attention_jax
     build_hot_kv_buffer = _dkm.build_hot_kv_buffer
     kascade_sparse_decode_hotbuf = _dkm.kascade_sparse_decode_hotbuf
+    hotbuf_attention = _dkm.hotbuf_attention
+    build_prefill_causal_mask = _dkm.build_prefill_causal_mask
+    hotbuf_prefill_attention_chunked = _dkm.hotbuf_prefill_attention_chunked
     kascade_sparse_decode_pallas_v2 = getattr(_dkm, 'kascade_sparse_decode_pallas_v2', None)
     DECODE_KERNEL_AVAILABLE = True
 except Exception as e:
@@ -65,6 +68,9 @@ except Exception as e:
     dense_decode_attention_jax = None
     build_hot_kv_buffer = None
     kascade_sparse_decode_hotbuf = None
+    hotbuf_attention = None
+    build_prefill_causal_mask = None
+    hotbuf_prefill_attention_chunked = None
     kascade_sparse_decode_pallas_v2 = None
     DECODE_KERNEL_AVAILABLE = False
 

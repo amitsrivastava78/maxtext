@@ -1294,6 +1294,60 @@ def build_hot_kv_buffer(
     return hot_k, hot_v
 
 
+def hotbuf_attention(
+    q: jax.Array,        # [B, H, Sq, D]  — Sq=1 for decode, Sq=S for prefill
+    hot_k: jax.Array,    # [B, H, sparse_len, D]  — pre-gathered, contiguous
+    hot_v: jax.Array,    # [B, H, sparse_len, D]  — pre-gathered, contiguous
+    causal_mask: Optional[jax.Array] = None,  # [B, H, Sq, sparse_len] or None
+    sm_scale: Optional[float] = None,
+) -> jax.Array:
+    """Unified attention on pre-gathered contiguous 'hot' KV buffers.
+
+    Works for BOTH decode and prefill:
+
+    **Decode** (Sq=1, causal_mask=None):
+        Q is a single new token. All tokens in hot buffer are past tokens,
+        so no causal masking needed. This is just dense attention on the
+        small hot buffer.
+
+    **Prefill** (Sq=S, causal_mask provided):
+        Q is the full sequence. The causal_mask encodes which query
+        positions can attend to which hot buffer positions based on
+        the original tile positions. Shape: [B, H, S, sparse_len].
+        Positions where mask is False get -inf scores.
+
+    Since the hot buffer is CONTIGUOUS in memory, TPU reads it at
+    near-peak HBM bandwidth — unlike any gather-based approach.
+
+    The key insight: instead of Q[S] × K[S] = O(S²) for full attention,
+    we compute Q[S] × hot_K[sparse_len] = O(S × sparse_len). At 10%
+    sparsity this is 10× less memory AND 10× less compute.
+
+    Args:
+        q: [B, H, Sq, D] — Sq=1 for decode, Sq=S for prefill
+        hot_k: [B, H, sparse_len, D] — contiguous key buffer
+        hot_v: [B, H, sparse_len, D] — contiguous value buffer
+        causal_mask: [B, H, Sq, sparse_len] bool or None
+            True = attend, False = mask out. None = attend to all (decode).
+        sm_scale: softmax scale, defaults to 1/sqrt(D)
+
+    Returns:
+        output: [B, H, Sq, D]
+    """
+    D = q.shape[-1]
+    if sm_scale is None:
+        sm_scale = D ** -0.5
+
+    scores = jnp.einsum('bhqd,bhkd->bhqk', q, hot_k) * sm_scale
+
+    if causal_mask is not None:
+        scores = jnp.where(causal_mask, scores, DEFAULT_MASK_VALUE)
+
+    weights = jax.nn.softmax(scores, axis=-1)
+    output = jnp.einsum('bhqk,bhkd->bhqd', weights, hot_v)
+    return output
+
+
 def kascade_sparse_decode_hotbuf(
     q: jax.Array,        # [B, H, 1, D]
     hot_k: jax.Array,    # [B, H, sparse_len, D]  — pre-gathered, contiguous
@@ -1302,9 +1356,8 @@ def kascade_sparse_decode_hotbuf(
 ) -> jax.Array:
     """Decode attention on pre-gathered contiguous 'hot' KV buffers.
 
-    This is functionally identical to dense_decode_attention_jax but on
-    a reduced-length KV buffer. Since the buffer is contiguous in memory,
-    TPU reads it at near-peak HBM bandwidth — the same efficiency as dense.
+    Thin wrapper around hotbuf_attention() with causal_mask=None.
+    For decode, all hot buffer tokens are past tokens → no masking needed.
 
     Use with build_hot_kv_buffer():
         hot_k, hot_v = build_hot_kv_buffer(k_cache, v_cache, tile_indices)
@@ -1319,14 +1372,118 @@ def kascade_sparse_decode_hotbuf(
     Returns:
         output: [B, H, 1, D]
     """
-    D = q.shape[-1]
+    return hotbuf_attention(q, hot_k, hot_v, causal_mask=None, sm_scale=sm_scale)
+
+
+def build_prefill_causal_mask(
+    seq_len: int,
+    tile_indices: jax.Array,  # [B, H, top_k]
+    tile_size: int = 128,
+) -> jax.Array:
+    """Build causal mask for prefill attention on hot KV buffers.
+
+    For prefill, each query at position q_pos can only attend to KV tokens
+    at positions <= q_pos. The hot buffer contains tokens from specific
+    tiles, so we need to map tile indices back to original positions.
+
+    Args:
+        seq_len: total sequence length S
+        tile_indices: [B, H, top_k] — which tiles were selected
+        tile_size: tokens per tile
+
+    Returns:
+        causal_mask: [B, H, S, sparse_len] bool
+            True where query at pos q can attend to hot buffer position k.
+    """
+    B, H, top_k = tile_indices.shape
+    sparse_len = top_k * tile_size
+
+    # Convert tile indices to token positions: [B, H, sparse_len]
+    offsets = jnp.arange(tile_size, dtype=jnp.int32)  # [tile_size]
+    tile_starts = tile_indices[..., None] * tile_size   # [B, H, top_k, 1]
+    token_positions = (tile_starts + offsets[None, None, None, :]).reshape(
+        B, H, sparse_len)  # [B, H, sparse_len]
+
+    # Query positions: [S]
+    q_positions = jnp.arange(seq_len, dtype=jnp.int32)  # [S]
+
+    # Causal mask: query at pos q attends to token at pos k iff k <= q
+    # q_positions: [S] -> [1, 1, S, 1]
+    # token_positions: [B, H, sparse_len] -> [B, H, 1, sparse_len]
+    causal_mask = (
+        token_positions[:, :, None, :]  # [B, H, 1, sparse_len]
+        <= q_positions[None, None, :, None]  # [1, 1, S, 1]
+    )  # [B, H, S, sparse_len]
+
+    return causal_mask
+
+
+def hotbuf_prefill_attention_chunked(
+    q: jax.Array,        # [B, H, S, D]
+    hot_k: jax.Array,    # [B, H, sparse_len, D]
+    hot_v: jax.Array,    # [B, H, sparse_len, D]
+    tile_indices: jax.Array,  # [B, H, top_k]
+    tile_size: int = 128,
+    chunk_size: int = 512,
+    sm_scale: Optional[float] = None,
+) -> jax.Array:
+    """Chunked prefill attention on hot KV buffers (memory-efficient).
+
+    Splits the query sequence into chunks to avoid materializing the
+    full [S, sparse_len] score matrix. At S=131K, sparse_len=3200:
+    full matrix = 131K × 3200 × 4B = 1.6 GB. Chunking to 512 queries:
+    512 × 3200 × 4B = 6.5 MB per chunk.
+
+    Args:
+        q: [B, H, S, D] — full query sequence
+        hot_k: [B, H, sparse_len, D] — pre-gathered hot key buffer
+        hot_v: [B, H, sparse_len, D] — pre-gathered hot value buffer
+        tile_indices: [B, H, top_k] — tile indices for causal mask
+        tile_size: tokens per tile
+        chunk_size: queries per chunk (controls peak memory)
+        sm_scale: softmax scale
+
+    Returns:
+        output: [B, H, S, D]
+    """
+    B, H, S, D = q.shape
+    top_k = tile_indices.shape[2]
+    sparse_len = top_k * tile_size
+
     if sm_scale is None:
         sm_scale = D ** -0.5
 
-    scores = jnp.einsum('bhqd,bhkd->bhqk', q, hot_k) * sm_scale
-    weights = jax.nn.softmax(scores, axis=-1)
-    output = jnp.einsum('bhqk,bhkd->bhqd', weights, hot_v)
-    return output
+    # Pre-compute token positions in hot buffer: [B, H, sparse_len]
+    offsets = jnp.arange(tile_size, dtype=jnp.int32)
+    tile_starts = tile_indices[..., None] * tile_size
+    token_positions = (tile_starts + offsets[None, None, None, :]).reshape(
+        B, H, sparse_len)
+
+    # Process in chunks to limit memory
+    outputs = []
+    for start in range(0, S, chunk_size):
+        end = min(start + chunk_size, S)
+        q_chunk = q[:, :, start:end, :]  # [B, H, C, D]
+        C = end - start
+
+        # Scores: [B, H, C, sparse_len]
+        scores = jnp.einsum('bhqd,bhkd->bhqk', q_chunk, hot_k) * sm_scale
+
+        # Causal mask for this chunk: query positions [start, end)
+        q_pos = jnp.arange(start, end, dtype=jnp.int32)  # [C]
+        # token_positions: [B, H, sparse_len] -> [B, H, 1, sparse_len]
+        # q_pos: [C] -> [1, 1, C, 1]
+        chunk_mask = (
+            token_positions[:, :, None, :]  # [B, H, 1, sparse_len]
+            <= q_pos[None, None, :, None]   # [1, 1, C, 1]
+        )  # [B, H, C, sparse_len]
+
+        scores = jnp.where(chunk_mask, scores, DEFAULT_MASK_VALUE)
+        weights = jax.nn.softmax(scores, axis=-1)
+        out_chunk = jnp.einsum('bhqk,bhkd->bhqd', weights, hot_v)
+        outputs.append(out_chunk)
+
+    return jnp.concatenate(outputs, axis=2)  # [B, H, S, D]
 
 
 # ============================================================
@@ -1522,6 +1679,9 @@ __all__ = [
     'kascade_sparse_decode_pallas',
     'dense_decode_attention_jax',
     'build_hot_kv_buffer',
+    'hotbuf_attention',
+    'build_prefill_causal_mask',
+    'hotbuf_prefill_attention_chunked',
     'get_decode_tile_indices',
     'benchmark_sparse_vs_dense_decode',
 ]
