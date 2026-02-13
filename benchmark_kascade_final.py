@@ -711,7 +711,8 @@ def _compute_tile_scores(q, k, tile_size, top_k):
     return group_tile_indices
 
 
-def prefill_build_kv_caches(params, input_ids):
+def prefill_build_kv_caches(params, input_ids, schedule=None,
+                            decode_tile_size=None, decode_top_k=None):
     """Run dense prefill through all layers, return per-layer KV caches.
 
     Uses chunked causal attention — works at any seq_len without
@@ -722,12 +723,21 @@ def prefill_build_kv_caches(params, input_ids):
     have the same weight shapes) → 16× faster compilation than tracing
     each layer separately.
 
+    When schedule + decode_tile_size + decode_top_k are provided, also
+    computes tile indices for REUSE layers from the real Q,K activations
+    of their anchor layers.  This gives decode real calibration-quality
+    tile selections instead of random indices.
+
     Args:
         params: params_dict['params'] — raw weight dict
         input_ids: [B, S] int32
+        schedule: optional layer schedule dict (for computing tile indices)
+        decode_tile_size: tile size for decode tile index computation
+        decode_top_k: top-k tiles for decode tile index computation
     Returns:
         kv_caches: dict[layer_id] -> (k, v) each [B, H, S, D]
         prefill_ppl: float
+        decode_tile_indices: dict[layer_id] -> [B, H, top_k] (only if schedule given)
     """
     B, S = input_ids.shape
     freq_cis = precompute_freqs_cis(HEAD_DIM, S, theta=500000.0,
@@ -735,9 +745,13 @@ def prefill_build_kv_caches(params, input_ids):
     x = params['tok_embeddings']['embedding'][input_ids]  # [B, S, E]
 
     kv_caches = {}
+    # If schedule provided, compute tile indices from real Q,K
+    compute_tile_idx = (schedule is not None and decode_tile_size is not None
+                        and decode_top_k is not None)
+    anchor_qk = {}  # anchor_layer_id -> (q, k) for tile score computation
     for i in range(NUM_LAYERS):
         lw = params[f'layer_{i}']
-        x, _q, k, v = _dense_layer_fn(
+        x, q_i, k, v = _dense_layer_fn(
             x, lw['attention_norm']['scale'],
             lw['DenseFullAttention_0']['Dense_0']['kernel'],
             lw['DenseFullAttention_0']['Dense_1']['kernel'],
@@ -749,12 +763,41 @@ def prefill_build_kv_caches(params, input_ids):
             lw['down_proj']['kernel'],
             freq_cis)
         kv_caches[i] = (k, v)
+        # Save Q,K from anchor layers for tile score computation
+        if compute_tile_idx:
+            plan = schedule.get(i, {"type": "ANCHOR"})
+            if plan["type"] in ("DENSE", "ANCHOR"):
+                anchor_qk[i] = (q_i, k)
 
     x = rms_norm_fn(x, params['norm']['scale'])
 
     # Compute PPL via chunked logits to avoid materializing [1, S, VOCAB]
     prefill_ppl = _compute_ppl_chunked(x, input_ids, params['output']['kernel'])
-    return kv_caches, prefill_ppl
+
+    # Compute real tile indices for decode REUSE layers
+    decode_tile_indices = {}
+    if compute_tile_idx:
+        for layer_id, plan in schedule.items():
+            if plan["type"] == "REUSE":
+                anchor_id = plan["anchor_id"]
+                if anchor_id in anchor_qk:
+                    q_anc, k_anc = anchor_qk[anchor_id]
+                    # Compute tile scores at decode tile_size and top_k
+                    full_indices = _compute_tile_scores(
+                        q_anc, k_anc, decode_tile_size, decode_top_k)
+                    # full_indices: [B, H, Qg, top_k] — take last Q-tile for decode
+                    decode_idx = full_indices[:, :, -1, :]  # [B, H, top_k]
+                    # Apply head mapping
+                    head_map = plan.get("head_map", {})
+                    if head_map:
+                        perm_list = [head_map.get(h, h) for h in range(decode_idx.shape[1])]
+                        perm_indices = jnp.array(perm_list, dtype=jnp.int32)
+                        decode_idx = decode_idx[:, perm_indices]
+                    decode_tile_indices[layer_id] = decode_idx
+        # Free anchor Q,K
+        del anchor_qk
+
+    return kv_caches, prefill_ppl, decode_tile_indices
 
 
 @jax.jit
@@ -1140,7 +1183,7 @@ def parse_args():
     parser.add_argument("--decode", action="store_true", default=False,
         help="Run decode benchmark: hot buffer sparse vs dense")
     parser.add_argument("--decode_only", action="store_true", default=False,
-        help="Run ONLY decode benchmark with synthetic KV caches (skips prefill/PPL, no OOM at long seq)")
+        help="Run ONLY decode benchmark (skips PPL/prefill-speedup, still uses real prefill for KV caches)")
     parser.add_argument("--decode_steps", type=int, default=20,
         help="Number of decode steps to time")
     parser.add_argument("--decode_seq_len", type=int, default=None,
@@ -1238,32 +1281,49 @@ def main():
     
     dataset = load_dataset("allenai/c4", "en", split="validation", streaming=True)
     
+    # Determine max sequence length needed (for decode we need longer text)
+    decode_seq_len_requested = args.decode_seq_len if args.decode_seq_len is not None else SEQ_LEN
+    max_seq_needed = max(SEQ_LEN, decode_seq_len_requested) if (args.decode or args.decode_only) else SEQ_LEN
+    
     all_tokens = []
     doc_count = 0
-    needed_tokens = 3 * SEQ_LEN
+    needed_tokens = max_seq_needed + 2 * SEQ_LEN  # decode_text + calib + test
     for example in dataset:
         if len(all_tokens) >= needed_tokens:
             break
         tokens = tokenizer.encode(example['text'][:100000], add_special_tokens=False)
         all_tokens.extend(tokens)
         doc_count += 1
-        if doc_count >= 500:  # Enough docs for 32K+ tokens
+        if doc_count >= 5000:  # Enough docs for long sequences
             break
     
     print(f"   Collected {len(all_tokens):,} tokens from {doc_count} documents")
     
-    if len(all_tokens) < 3 * SEQ_LEN:
-        raise ValueError(f"Not enough tokens: {len(all_tokens)} < {3 * SEQ_LEN}")
+    if len(all_tokens) < needed_tokens:
+        print(f"   ⚠ Only {len(all_tokens):,} tokens, need {needed_tokens:,}")
+        if len(all_tokens) < 3 * SEQ_LEN:
+            raise ValueError(f"Not enough tokens: {len(all_tokens)} < {3 * SEQ_LEN}")
+        # Reduce decode seq_len to what we can afford
+        max_seq_needed = min(max_seq_needed, len(all_tokens) - 2 * SEQ_LEN)
+        print(f"   Auto-reduced decode seq_len to {max_seq_needed:,}")
     
     all_tokens = [min(t, VOCAB_SIZE - 1) for t in all_tokens]
     
     # Use DISJOINT sequences for calibration vs test to avoid bias
     # Calibration: first SEQ_LEN tokens
-    # Test: LAST SEQ_LEN tokens (maximum separation)
+    # Test: next SEQ_LEN tokens
+    # Decode: last max_seq_needed tokens (real text for KV cache)
     calib_ids = jnp.array([all_tokens[:SEQ_LEN]], dtype=jnp.int32)
-    test_ids = jnp.array([all_tokens[-SEQ_LEN:]], dtype=jnp.int32)
-    print(f"   Calibration: {calib_ids.shape[1]:,} tokens (start of dataset)")
-    print(f"   Test:        {test_ids.shape[1]:,} tokens (end of dataset, ~{len(all_tokens)-SEQ_LEN:,} tokens apart)")
+    test_ids = jnp.array([all_tokens[SEQ_LEN:2*SEQ_LEN]], dtype=jnp.int32)
+    if (args.decode or args.decode_only) and max_seq_needed > SEQ_LEN:
+        decode_text_ids = jnp.array([all_tokens[-max_seq_needed:]], dtype=jnp.int32)
+        print(f"   Calibration: {calib_ids.shape[1]:,} tokens (start of dataset)")
+        print(f"   Test:        {test_ids.shape[1]:,} tokens (for PPL evaluation)")
+        print(f"   Decode text: {decode_text_ids.shape[1]:,} tokens (for real KV cache)")
+    else:
+        decode_text_ids = test_ids  # fallback: reuse test tokens
+        print(f"   Calibration: {calib_ids.shape[1]:,} tokens (start of dataset)")
+        print(f"   Test:        {test_ids.shape[1]:,} tokens (end of dataset, ~{SEQ_LEN:,} tokens apart)")
     
     # Calibrate
     schedule = calibrate_on_real_text_optimized(params_dict, calib_ids, args.threshold, args.max_reuse_dist)
@@ -1276,7 +1336,7 @@ def main():
     # These are available because calibration runs all layers as ANCHOR.
     #
     # Two maps:
-    #   tile_indices_map      [B, H, top_k]           last Q-tile only → decode
+    #   tile_indices_map      [B, H, top_k]           last Q-tile only (calibration-based)
     #   tile_indices_full_map  [B, H, Qg, top_k]       per-Q-tile    → prefill (fallback)
     #
     # NOTE: For prefill PPL, ANCHOR layers compute FRESH tile scores on
@@ -1284,8 +1344,9 @@ def main():
     # is only used as a fallback if fresh scores are unavailable.
     # Head mapping is applied at runtime in hotbuf_prefill_build_kv_caches.
     #
-    # For decode, we still use calibration indices with head mapping applied.
-    tile_indices_map = {}       # for decode: [B, H, top_k] (head-mapped)
+    # For decode: tile_indices_map is RECOMPUTED from real prefill Q,K
+    # at decode_seq_len in the decode section below (NOT these calibration ones).
+    tile_indices_map = {}       # calibration-based (overwritten by decode prefill)
     tile_indices_full_map = {}  # for prefill fallback: [B, H, Qg, top_k] (RAW, no head map)
     for layer_id, plan in schedule.items():
         if plan["type"] == "REUSE":
@@ -1379,7 +1440,7 @@ def main():
       # Warmup run for JIT compilation (both paths)
       # Free KV immediately — we'll rebuild for decode later
       print("   Warming up JIT (dense)...")
-      kv_warm, _ = prefill_build_kv_caches(params, test_ids)
+      kv_warm, _, _ = prefill_build_kv_caches(params, test_ids)
       del kv_warm
       print("   Warming up JIT (sparse)...")
       kv_warm2, _ = hotbuf_prefill_build_kv_caches(
@@ -1394,7 +1455,7 @@ def main():
       for run_i in range(n_runs):
           # Dense
           t0 = time.perf_counter()
-          kv_tmp, _ = prefill_build_kv_caches(params, test_ids)
+          kv_tmp, _, _ = prefill_build_kv_caches(params, test_ids)
           jax.block_until_ready(kv_tmp)
           dense_times_ms.append((time.perf_counter() - t0) * 1000)
           del kv_tmp
@@ -1473,40 +1534,49 @@ def main():
         print(f"  DECODE BENCHMARK  (Batch={DECODE_BATCH}, SeqLen={DECODE_SEQ_LEN:,})")
         print("=" * 70)
         
-        # --- Build KV caches at decode-specific S and B ---
-        if args.decode_only:
-            print(f"\n  Building KV caches (B={DECODE_BATCH}, S={DECODE_SEQ_LEN:,})...")
-            rng = jax.random.PRNGKey(42)
-            kv_caches = {}
-            for i in range(NUM_LAYERS):
-                rng, k_rng, v_rng = jax.random.split(rng, 3)
-                k = jax.random.normal(k_rng, (DECODE_BATCH, NUM_HEADS, DECODE_SEQ_LEN, HEAD_DIM), dtype=COMPUTE_DTYPE)
-                v = jax.random.normal(v_rng, (DECODE_BATCH, NUM_HEADS, DECODE_SEQ_LEN, HEAD_DIM), dtype=COMPUTE_DTYPE)
-                kv_caches[i] = (k, v)
+        # --- Build KV caches via REAL PREFILL at DECODE_SEQ_LEN ---
+        # Always prefill on real text to fill KV caches with real activations.
+        # Also computes real tile indices from anchor Q,K activations.
+        print(f"\n  Running prefill on real text (S={DECODE_SEQ_LEN:,})...")
+        
+        # Prepare input_ids at DECODE_SEQ_LEN
+        if DECODE_SEQ_LEN <= decode_text_ids.shape[1]:
+            prefill_ids = decode_text_ids[:, :DECODE_SEQ_LEN]
         else:
-            print(f"\n  Building KV caches via prefill (S={SEQ_LEN:,})...")
-            kv_caches, _ = prefill_build_kv_caches(params, test_ids)
-            DECODE_SEQ_LEN = SEQ_LEN  # prefill-built caches have SEQ_LEN
-            if DECODE_BATCH > 1:
-                # Broadcast B=1 prefill caches to B=DECODE_BATCH
-                for i in kv_caches:
-                    k, v = kv_caches[i]
-                    kv_caches[i] = (
-                        jnp.broadcast_to(k, (DECODE_BATCH, *k.shape[1:])),
-                        jnp.broadcast_to(v, (DECODE_BATCH, *v.shape[1:])))
+            # Pad with first tokens if not enough (shouldn't happen with enough text)
+            pad_len = DECODE_SEQ_LEN - decode_text_ids.shape[1]
+            prefill_ids = jnp.concatenate([
+                decode_text_ids,
+                jnp.zeros((1, pad_len), dtype=jnp.int32)], axis=1)
+            print(f"   ⚠ Padded {pad_len} tokens (only had {decode_text_ids.shape[1]:,})")
+        
+        kv_caches, prefill_ppl_decode, tile_indices_map = prefill_build_kv_caches(
+            params, prefill_ids,
+            schedule=schedule,
+            decode_tile_size=decode_ts,
+            decode_top_k=decode_tk)
+        
+        print(f"   Prefill PPL (decode text): {prefill_ppl_decode:.4f}")
+        print(f"   Real tile indices: {len(tile_indices_map)} REUSE layers")
+        if tile_indices_map:
+            sample_idx = next(iter(tile_indices_map.values()))
+            print(f"   Tile index shape: {list(sample_idx.shape)} (B={sample_idx.shape[0]}, H={sample_idx.shape[1]}, top_k={sample_idx.shape[2]})")
+        
+        # Broadcast B=1 prefill caches to DECODE_BATCH
+        if DECODE_BATCH > 1:
+            for i in kv_caches:
+                k, v = kv_caches[i]
+                kv_caches[i] = (
+                    jnp.broadcast_to(k, (DECODE_BATCH, *k.shape[1:])),
+                    jnp.broadcast_to(v, (DECODE_BATCH, *v.shape[1:])))
+            # Broadcast tile indices too
+            for layer_id in tile_indices_map:
+                idx = tile_indices_map[layer_id]  # [1, H, top_k]
+                tile_indices_map[layer_id] = jnp.broadcast_to(
+                    idx, (DECODE_BATCH, *idx.shape[1:]))
+        
         kv_gb = DECODE_BATCH * kv_per_item_gb
         print(f"   KV caches: {NUM_LAYERS} layers × [{DECODE_BATCH}, {NUM_HEADS}, {DECODE_SEQ_LEN:,}, {HEAD_DIM}] = {kv_gb:.1f} GB")
-        
-        # Generate tile indices for REUSE layers: [B, H, top_k]
-        rng = jax.random.PRNGKey(42) if args.decode_only else jax.random.PRNGKey(99)
-        tile_indices_map = {}
-        for layer_id, plan in schedule.items():
-            if plan["type"] == "REUSE":
-                rng, idx_rng = jax.random.split(rng)
-                tile_idx = jax.random.randint(
-                    idx_rng, (DECODE_BATCH, NUM_HEADS, decode_tk),
-                    minval=0, maxval=decode_num_tiles)
-                tile_indices_map[layer_id] = tile_idx
         
         # Report configuration
         top_k = decode_tk
@@ -1599,16 +1669,11 @@ def main():
         
         embed_table = params['tok_embeddings']['embedding']
         last_pos = DECODE_SEQ_LEN - 2
-        if args.decode_only:
-            # Synthetic mode: use random embedding, no target token
-            tok_last = jax.random.normal(
-                jax.random.PRNGKey(123), (DECODE_BATCH, 1, EMBED_DIM), dtype=COMPUTE_DTYPE)
-            target_token = None
-        else:
-            tok_last = embed_table[test_ids[0, last_pos]][None, None, :]
-            if DECODE_BATCH > 1:
-                tok_last = jnp.broadcast_to(tok_last, (DECODE_BATCH, 1, EMBED_DIM))
-            target_token = int(test_ids[0, last_pos + 1])
+        # Real prefill: use actual token embedding and target from prefill text
+        tok_last = embed_table[prefill_ids[0, last_pos]][None, None, :]
+        if DECODE_BATCH > 1:
+            tok_last = jnp.broadcast_to(tok_last, (DECODE_BATCH, 1, EMBED_DIM))
+        target_token = int(prefill_ids[0, last_pos + 1])
         qpos_last = jnp.array([last_pos], dtype=jnp.int32)
         
         logits_d = jit_dense(params, tok_last, kv_caches,
@@ -1633,10 +1698,7 @@ def main():
             print(f"\n   Dense    top-5:  {dense_top5.tolist()}  (NLL: {nll_d:.4f})")
             print(f"   HotBuf   top-5:  {hotbuf_top5.tolist()}  (NLL: {nll_h:.4f})")
             print(f"   Target token:    {target_token}")
-        else:
-            print(f"\n   Dense    top-5:  {dense_top5.tolist()}")
-            print(f"   HotBuf   top-5:  {hotbuf_top5.tolist()}")
-            print(f"   (decode_only mode: synthetic KV, no target token)")
+            print(f"   (Real KV caches from prefill on {DECODE_SEQ_LEN:,} tokens of C4 text)")
         print(f"   Top-1 match:     {'✅ YES' if top1_match else 'NO (rank swap)'}")
         print(f"   Dense #1 in top-5: {'✅ YES' if dense_top1_in_hotbuf5 else '❌ NO'}")
         print(f"   Top-5 overlap:   {top5_overlap}/5")
@@ -1995,14 +2057,19 @@ def main():
         print(f"\n  {'='*58}")
         print(f"  DECODE SUMMARY  (B={DECODE_BATCH}, S={DECODE_SEQ_LEN:,})")
         print(f"  {'='*58}")
+        print(f"   KV caches:         Real (from prefill on {DECODE_SEQ_LEN:,} tokens of C4 text)")
+        print(f"   Tile indices:      Real (from anchor Q,K activations)")
         print(f"   Correctness:       {'✅' if correctness_ok else '❌'}  "
               f"(top-5 overlap: {top5_overlap}/5, max Δ={max_logit_diff:.2f})")
         print(f"   Attention speedup: {attn_speedup_med:.2f}x  "
               f"(kernel working correctly)")
         print(f"   E2E speedup:       {speedup_med:.2f}x  "
               f"(B={DECODE_BATCH}, S={DECODE_SEQ_LEN:,})")
-        print(f"   Prefill speedup:   {prefill_speedup_measured:.2f}x  "
-              f"(sparse prefill is {prefill_attn_pct:.1f}% faster)")
+        if not args.decode_only:
+            print(f"   Prefill speedup:   {prefill_speedup_measured:.2f}x  "
+                  f"(sparse prefill is {prefill_attn_pct:.1f}% faster)")
+        else:
+            print(f"   Prefill speedup:   N/A (decode-only mode)")
         if attn_speedup_med > 1.5 and speedup_med < 1.1 and DECODE_BATCH == 1:
             print(f"\n   The {attn_speedup_med:.1f}x attention speedup is real but hidden")
             print(f"   behind {total_weight_mb:.0f} MB of weight loads that dominate B=1 decode.")
