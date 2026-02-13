@@ -1649,6 +1649,115 @@ def main():
             print(f"   ❌ Large logit divergence")
         
         # ================================================
+        # CROSS-KERNEL VALIDATION
+        # All REUSE layers × multiple Q vectors × 3 kernels
+        # ================================================
+        print(f"\n  {'='*58}")
+        print(f"  CROSS-KERNEL VALIDATION  (3 kernels × {n_reuse} layers × 5 Q vectors)")
+        print(f"  {'='*58}")
+        
+        n_q_tests = 5  # number of random Q vectors to test per layer
+        xk_threshold = 0.01  # max acceptable diff for bf16
+        
+        worst_hotbuf_ref = 0.0
+        worst_sparse_ref = 0.0
+        worst_hotbuf_sparse = 0.0
+        worst_dense_sparse = 0.0
+        total_tests = 0
+        failures = []
+        
+        print(f"\n   Testing {n_reuse} REUSE layers × {n_q_tests} Q vectors = {n_reuse * n_q_tests} comparisons")
+        print(f"   Q shape: [{DECODE_BATCH}, {NUM_HEADS}, 1, {HEAD_DIM}]  (B={DECODE_BATCH})")
+        print(f"   KV shape: [{DECODE_BATCH}, {NUM_HEADS}, {DECODE_SEQ_LEN:,}, {HEAD_DIM}]")
+        print(f"   Sparse: {top_k}/{decode_num_tiles} tiles = {sparse_tokens} tokens ({sparse_tokens/DECODE_SEQ_LEN*100:.1f}%)")
+        
+        for layer_id in tile_indices_map:
+            k_test, v_test = kv_caches[layer_id]
+            hot_k_xk = hot_kv_map[layer_id][0]
+            hot_v_xk = hot_kv_map[layer_id][1]
+            tile_idx_xk = tile_indices_map[layer_id]
+            
+            # Precompute manual reference tiles (shared across Q vectors)
+            B_xk, H_xk, S_xk, D_xk = k_test.shape
+            num_tiles_xk = S_xk // decode_ts
+            k_tiled = k_test.reshape(B_xk, H_xk, num_tiles_xk, decode_ts, D_xk)
+            v_tiled = v_test.reshape(B_xk, H_xk, num_tiles_xk, decode_ts, D_xk)
+            b_idx = jnp.arange(B_xk)[:, None, None]
+            h_idx = jnp.arange(H_xk)[None, :, None]
+            k_sel = k_tiled[b_idx, h_idx, tile_idx_xk].reshape(B_xk, H_xk, -1, D_xk)
+            v_sel = v_tiled[b_idx, h_idx, tile_idx_xk].reshape(B_xk, H_xk, -1, D_xk)
+            sm_scale = D_xk ** -0.5
+            
+            layer_max_hr = 0.0
+            layer_max_sr = 0.0
+            layer_max_hs = 0.0
+            layer_max_ds = 0.0
+            
+            for qi in range(n_q_tests):
+                q_xk = jax.random.normal(
+                    jax.random.PRNGKey(layer_id * 100 + qi),
+                    (DECODE_BATCH, NUM_HEADS, 1, HEAD_DIM), dtype=COMPUTE_DTYPE)
+                
+                # Kernel 1: hotbuf (pre-gathered einsum)
+                out_hotbuf = hotbuf_decode_attn(q_xk, hot_k_xk, hot_v_xk)
+                
+                # Kernel 2: sparse (gather-from-full-KV)
+                out_sparse = sparse_decode_attn(
+                    q_xk, k_test, v_test, tile_idx_xk, decode_ts, backend=None)
+                
+                # Kernel 3: manual reference (inline JAX)
+                scores_ref = jnp.einsum('bhqd,bhkd->bhqk', q_xk, k_sel) * sm_scale
+                weights_ref = jax.nn.softmax(scores_ref, axis=-1)
+                out_ref = jnp.einsum('bhqk,bhkd->bhqd', weights_ref, v_sel)
+                
+                # Dense (full KV) for comparison
+                out_dense = dense_decode_attn(q_xk, k_test, v_test, query_pos)
+                
+                d_hr = float(jnp.max(jnp.abs(out_hotbuf - out_ref)))
+                d_sr = float(jnp.max(jnp.abs(out_sparse - out_ref)))
+                d_hs = float(jnp.max(jnp.abs(out_hotbuf - out_sparse)))
+                d_ds = float(jnp.max(jnp.abs(out_dense - out_hotbuf)))
+                
+                layer_max_hr = max(layer_max_hr, d_hr)
+                layer_max_sr = max(layer_max_sr, d_sr)
+                layer_max_hs = max(layer_max_hs, d_hs)
+                layer_max_ds = max(layer_max_ds, d_ds)
+                total_tests += 1
+                
+                if d_hr >= xk_threshold or d_sr >= xk_threshold or d_hs >= xk_threshold:
+                    failures.append((layer_id, qi, d_hr, d_sr, d_hs))
+            
+            worst_hotbuf_ref = max(worst_hotbuf_ref, layer_max_hr)
+            worst_sparse_ref = max(worst_sparse_ref, layer_max_sr)
+            worst_hotbuf_sparse = max(worst_hotbuf_sparse, layer_max_hs)
+            worst_dense_sparse = max(worst_dense_sparse, layer_max_ds)
+            
+            status = '✅' if layer_max_hr < xk_threshold and layer_max_sr < xk_threshold else '❌'
+            print(f"   Layer {layer_id:2d}: hotbuf↔ref {layer_max_hr:.6f}  "
+                  f"sparse↔ref {layer_max_sr:.6f}  "
+                  f"dense↔sparse {layer_max_ds:.4f}  {status}")
+        
+        print(f"\n   Worst-case max|Δ| across all {total_tests} tests:")
+        print(f"     hotbuf vs reference:   {worst_hotbuf_ref:.6f}  "
+              f"{'✅' if worst_hotbuf_ref < xk_threshold else '❌'}")
+        print(f"     sparse vs reference:   {worst_sparse_ref:.6f}  "
+              f"{'✅' if worst_sparse_ref < xk_threshold else '❌'}")
+        print(f"     hotbuf vs sparse:      {worst_hotbuf_sparse:.6f}  "
+              f"{'✅' if worst_hotbuf_sparse < xk_threshold else '❌'}")
+        print(f"     dense  vs sparse:      {worst_dense_sparse:.6f}  "
+              f"(expected: >0, sparsity approximation)")
+        
+        all_match = (worst_hotbuf_ref < xk_threshold and worst_sparse_ref < xk_threshold
+                     and worst_hotbuf_sparse < xk_threshold)
+        if all_match:
+            print(f"\n   ✅ All {total_tests} tests passed — 3 sparse kernels produce identical output")
+            print(f"   across all {n_reuse} REUSE layers × {n_q_tests} Q vectors (B={DECODE_BATCH})")
+        else:
+            print(f"\n   ❌ {len(failures)} failures detected:")
+            for lid, qi, dhr, dsr, dhs in failures[:5]:
+                print(f"     Layer {lid}, Q#{qi}: hotbuf↔ref={dhr:.6f} sparse↔ref={dsr:.6f}")
+        
+        # ================================================
         # DECODE LATENCY BENCHMARK
         # ================================================
         print(f"\n  {'='*58}")
