@@ -47,6 +47,7 @@ BLOCK_SPARSE_AVAILABLE = getattr(kascade_module, 'BLOCK_SPARSE_AVAILABLE', False
 # (avoids separate module with different _SPARSE_SPLASH_CACHE dict)
 TOKAMAX_SPLASH_AVAILABLE = getattr(kascade_module, 'TOKAMAX_SPLASH_AVAILABLE', False)
 prewarm_sparse_kernels = getattr(kascade_module, 'prewarm_sparse_kernels', None)
+tpu_chunked_causal_attention = kascade_module.tpu_chunked_causal_attention
 
 # Decode kernel: sparse decode (loads only selected tiles from full KV cache)
 kascade_sparse_decode = getattr(kascade_module, 'kascade_sparse_decode', None)
@@ -748,10 +749,17 @@ def prefill_build_kv_caches(params, input_ids, schedule=None,
     # If schedule provided, compute tile indices from real Q,K
     compute_tile_idx = (schedule is not None and decode_tile_size is not None
                         and decode_top_k is not None)
-    anchor_qk = {}  # anchor_layer_id -> (q, k) for tile score computation
+    # For tile indices: compute immediately per-anchor, don't hold Q,K across layers
+    anchor_tile_indices = {}  # anchor_layer_id -> [B, H, Qg, top_k]
+    # JIT the layer function INLINE (not as decorator) so we can del it
+    # after the loop to free XLA compilation cache & scratch buffers.
+    # At S=8192, lax.scan scratch can consume ~24 GB of compilation artifacts.
+    # Using chunked attention (no Tokamax) to avoid tracer leaks at long S.
+    layer_fn = jax.jit(_dense_layer_fn_jit_safe)
+    jit_tile_scores = jax.jit(_compute_tile_scores, static_argnums=(2, 3))
     for i in range(NUM_LAYERS):
         lw = params[f'layer_{i}']
-        x, q_i, k, v = _dense_layer_fn(
+        x, q_i, k, v = layer_fn(
             x, lw['attention_norm']['scale'],
             lw['DenseFullAttention_0']['Dense_0']['kernel'],
             lw['DenseFullAttention_0']['Dense_1']['kernel'],
@@ -763,28 +771,34 @@ def prefill_build_kv_caches(params, input_ids, schedule=None,
             lw['down_proj']['kernel'],
             freq_cis)
         kv_caches[i] = (k, v)
-        # Save Q,K from anchor layers for tile score computation
+        # Compute tile indices immediately for anchor layers, then free Q,K
         if compute_tile_idx:
             plan = schedule.get(i, {"type": "ANCHOR"})
             if plan["type"] in ("DENSE", "ANCHOR"):
-                anchor_qk[i] = (q_i, k)
+                anchor_tile_indices[i] = jit_tile_scores(
+                    q_i, k, decode_tile_size, decode_top_k)
+        del q_i  # free Q immediately (large at S=8192)
+
+    # Free JIT compilation cache BEFORE norm/PPL — at S=8192 the
+    # lax.scan scratch buffers can hold ~24 GB.
+    del layer_fn, jit_tile_scores
+    import gc; gc.collect()
+    jax.clear_caches()
 
     x = rms_norm_fn(x, params['norm']['scale'])
 
     # Compute PPL via chunked logits to avoid materializing [1, S, VOCAB]
     prefill_ppl = _compute_ppl_chunked(x, input_ids, params['output']['kernel'])
+    del x  # free hidden states
 
-    # Compute real tile indices for decode REUSE layers
+    # Build decode tile indices for REUSE layers from pre-computed anchor indices
     decode_tile_indices = {}
     if compute_tile_idx:
         for layer_id, plan in schedule.items():
             if plan["type"] == "REUSE":
                 anchor_id = plan["anchor_id"]
-                if anchor_id in anchor_qk:
-                    q_anc, k_anc = anchor_qk[anchor_id]
-                    # Compute tile scores at decode tile_size and top_k
-                    full_indices = _compute_tile_scores(
-                        q_anc, k_anc, decode_tile_size, decode_top_k)
+                if anchor_id in anchor_tile_indices:
+                    full_indices = anchor_tile_indices[anchor_id]
                     # full_indices: [B, H, Qg, top_k] — take last Q-tile for decode
                     decode_idx = full_indices[:, :, -1, :]  # [B, H, top_k]
                     # Apply head mapping
@@ -794,18 +808,64 @@ def prefill_build_kv_caches(params, input_ids, schedule=None,
                         perm_indices = jnp.array(perm_list, dtype=jnp.int32)
                         decode_idx = decode_idx[:, perm_indices]
                     decode_tile_indices[layer_id] = decode_idx
-        # Free anchor Q,K
-        del anchor_qk
+        del anchor_tile_indices
 
     return kv_caches, prefill_ppl, decode_tile_indices
 
 
-@jax.jit
-def _dense_layer_fn(x, attn_norm_scale, wq, wk, wv, wo,
-                    ffn_norm_scale, w_gate, w_up, w_down, freq_cis):
+def _causal_attention_chunked(q, k, v):
+    """JIT-safe causal attention using chunked scan (no Tokamax).
+    
+    Used for decode prefill where speed doesn't matter (runs once) but
+    JIT compilation is needed for proper XLA memory management.
+    Tokamax SplashAttention leaks tracers inside @jax.jit at long S.
+    tpu_chunked_causal_attention falls back to explicit for short S.
+    """
+    return tpu_chunked_causal_attention(q, k, v)
+
+
+def _dense_layer_fn_jit_safe(x, attn_norm_scale, wq, wk, wv, wo,
+                             ffn_norm_scale, w_gate, w_up, w_down, freq_cis):
+    """Layer using chunked attention (no Tokamax). NOT decorated @jax.jit.
+    
+    Caller wraps with jax.jit() inline and deletes the reference after use
+    so XLA compilation cache (scratch buffers) can be freed.
+    Used for decode prefill at long S (8K+).
+    """
+    B, S, E = x.shape
+    normed = rms_norm_fn(x, attn_norm_scale)
+    q = (normed @ wq).reshape(B, S, NUM_HEADS, HEAD_DIM)
+    kv_dim = wk.shape[1]
+    num_kv_heads = kv_dim // HEAD_DIM
+    k = (normed @ wk).reshape(B, S, num_kv_heads, HEAD_DIM)
+    v = (normed @ wv).reshape(B, S, num_kv_heads, HEAD_DIM)
+    q = jnp.transpose(q, (0, 2, 1, 3))
+    k = jnp.transpose(k, (0, 2, 1, 3))
+    v = jnp.transpose(v, (0, 2, 1, 3))
+    q, k = apply_rope(q, k, freq_cis)
+    if num_kv_heads < NUM_HEADS:
+        repeats = NUM_HEADS // num_kv_heads
+        k_full = jnp.repeat(k, repeats, axis=1)
+        v_full = jnp.repeat(v, repeats, axis=1)
+    else:
+        k_full = k
+        v_full = v
+    attn_out = _causal_attention_chunked(q, k_full, v_full)
+    attn_out = jnp.transpose(attn_out, (0, 2, 1, 3)).reshape(B, S, NUM_HEADS * HEAD_DIM)
+    attn_out = attn_out @ wo
+    x = x + attn_out
+    normed_ffn = rms_norm_fn(x, ffn_norm_scale)
+    gate = jax.nn.silu(normed_ffn @ w_gate)
+    up = normed_ffn @ w_up
+    x = x + (gate * up) @ w_down
+    return x, q, k_full, v_full
+
+
+def _dense_layer_fn_impl(x, attn_norm_scale, wq, wk, wv, wo,
+                         ffn_norm_scale, w_gate, w_up, w_down, freq_cis):
     """Single transformer layer: project + RoPE + dense attention + MLP.
     
-    JIT-compiled once, reused for all 16 layers (same shapes).
+    NOT JIT-compiled — safe to call with Tokamax SplashAttention at any S.
     Returns (x, q, k_full, v_full) — q and k are needed by anchor layers
     to compute fresh tile scores for REUSE layers.
     """
@@ -843,6 +903,18 @@ def _dense_layer_fn(x, attn_norm_scale, wq, wk, wv, wo,
     x = x + (gate * up) @ w_down
 
     return x, q, k_full, v_full
+
+
+@jax.jit
+def _dense_layer_fn(x, attn_norm_scale, wq, wk, wv, wo,
+                    ffn_norm_scale, w_gate, w_up, w_down, freq_cis):
+    """JIT-compiled wrapper — used for timing benchmarks at short S.
+    
+    At long S (8K+), Tokamax SplashAttention leaks tracers inside @jax.jit.
+    Use _dense_layer_fn_impl directly for those cases.
+    """
+    return _dense_layer_fn_impl(x, attn_norm_scale, wq, wk, wv, wo,
+                                ffn_norm_scale, w_gate, w_up, w_down, freq_cis)
 
 
 def _compute_ppl_chunked(x, input_ids, lm_head, logit_chunk=512):
@@ -1520,15 +1592,12 @@ def main():
         decode_ts, decode_tk = auto_params(DECODE_SEQ_LEN)
         decode_num_tiles = DECODE_SEQ_LEN // decode_ts
         
-        # Memory safety check
+        # Memory: KV stays at B=1 (einsum broadcasts to B=DECODE_BATCH)
         kv_per_item_gb = NUM_LAYERS * 2 * NUM_HEADS * DECODE_SEQ_LEN * HEAD_DIM * bpe / 1e9
-        total_decode_gb = model_gb + DECODE_BATCH * kv_per_item_gb + 1.5  # 1.5 GB headroom
+        hot_buf_gb = NUM_LAYERS * 2 * NUM_HEADS * decode_tk * decode_ts * HEAD_DIM * bpe / 1e9
+        total_decode_gb = model_gb + kv_per_item_gb + hot_buf_gb + 2.0  # 2 GB headroom
         if total_decode_gb > 30:
-            max_safe_b = int((30 - model_gb - 1.5) / kv_per_item_gb)
-            print(f"\n  ⚠ Decode B={DECODE_BATCH} S={DECODE_SEQ_LEN} would need {total_decode_gb:.1f} GB > 32 GB HBM")
-            print(f"    Max safe batch size at S={DECODE_SEQ_LEN}: B={max_safe_b}")
-            DECODE_BATCH = max(1, max_safe_b)
-            print(f"    Auto-reduced to B={DECODE_BATCH}")
+            print(f"\n  ⚠ Decode S={DECODE_SEQ_LEN}: B=1 KV + model + hot bufs = {total_decode_gb:.1f} GB > 30 GB")
         
         print("\n" + "=" * 70)
         print(f"  DECODE BENCHMARK  (Batch={DECODE_BATCH}, SeqLen={DECODE_SEQ_LEN:,})")
@@ -1556,27 +1625,21 @@ def main():
             decode_tile_size=decode_ts,
             decode_top_k=decode_tk)
         
+        # Free compilation artifacts (prefill_ids kept for sanity check)
+        import gc; gc.collect()
+        jax.clear_caches()
+        
         print(f"   Prefill PPL (decode text): {prefill_ppl_decode:.4f}")
         print(f"   Real tile indices: {len(tile_indices_map)} REUSE layers")
         if tile_indices_map:
             sample_idx = next(iter(tile_indices_map.values()))
             print(f"   Tile index shape: {list(sample_idx.shape)} (B={sample_idx.shape[0]}, H={sample_idx.shape[1]}, top_k={sample_idx.shape[2]})")
         
-        # Broadcast B=1 prefill caches to DECODE_BATCH
-        if DECODE_BATCH > 1:
-            for i in kv_caches:
-                k, v = kv_caches[i]
-                kv_caches[i] = (
-                    jnp.broadcast_to(k, (DECODE_BATCH, *k.shape[1:])),
-                    jnp.broadcast_to(v, (DECODE_BATCH, *v.shape[1:])))
-            # Broadcast tile indices too
-            for layer_id in tile_indices_map:
-                idx = tile_indices_map[layer_id]  # [1, H, top_k]
-                tile_indices_map[layer_id] = jnp.broadcast_to(
-                    idx, (DECODE_BATCH, *idx.shape[1:]))
-        
-        kv_gb = DECODE_BATCH * kv_per_item_gb
-        print(f"   KV caches: {NUM_LAYERS} layers × [{DECODE_BATCH}, {NUM_HEADS}, {DECODE_SEQ_LEN:,}, {HEAD_DIM}] = {kv_gb:.1f} GB")
+        # KV caches stay at B=1 — JIT decode functions handle batch
+        # broadcast internally via einsum (no extra HBM allocation).
+        # Tile indices also stay at B=1.
+        kv_gb = 1 * kv_per_item_gb  # B=1 on device
+        print(f"   KV caches: {NUM_LAYERS} layers × [1, {NUM_HEADS}, {DECODE_SEQ_LEN:,}, {HEAD_DIM}] = {kv_gb:.1f} GB (B=1, einsum broadcasts to B={DECODE_BATCH})")
         
         # Report configuration
         top_k = decode_tk
@@ -1593,7 +1656,7 @@ def main():
         print(f"   Top-K tiles:    {top_k}/{decode_num_tiles} = {top_k/decode_num_tiles:.0%}")
         print(f"   Sparse tokens:  {sparse_tokens} = {top_k} tiles × {decode_ts} "
               f"({sparse_tokens / DECODE_SEQ_LEN * 100:.1f}% of {DECODE_SEQ_LEN})")
-        print(f"   Hot buffer:     [{DECODE_BATCH}, {NUM_HEADS}, {sparse_tokens}, {HEAD_DIM}] per REUSE layer")
+        print(f"   Hot buffer:     [1, {NUM_HEADS}, {sparse_tokens}, {HEAD_DIM}] per REUSE layer (B=1, einsum broadcasts)")
         print(f"   Kernel:         hotbuf_attention (pre-gathered tiles, fused jnp.einsum)")
         
         # Precompute RoPE for decode seq_len
@@ -1729,8 +1792,8 @@ def main():
         failures = []
         
         print(f"\n   Testing {n_reuse} REUSE layers × {n_q_tests} Q vectors = {n_reuse * n_q_tests} comparisons")
-        print(f"   Q shape: [{DECODE_BATCH}, {NUM_HEADS}, 1, {HEAD_DIM}]  (B={DECODE_BATCH})")
-        print(f"   KV shape: [{DECODE_BATCH}, {NUM_HEADS}, {DECODE_SEQ_LEN:,}, {HEAD_DIM}]")
+        print(f"   Q shape: [1, {NUM_HEADS}, 1, {HEAD_DIM}]  (B=1, matches KV)")
+        print(f"   KV shape: [1, {NUM_HEADS}, {DECODE_SEQ_LEN:,}, {HEAD_DIM}]  (B=1)")
         print(f"   Sparse: {top_k}/{decode_num_tiles} tiles = {sparse_tokens} tokens ({sparse_tokens/DECODE_SEQ_LEN*100:.1f}%)")
         
         for layer_id in tile_indices_map:
@@ -1758,7 +1821,7 @@ def main():
             for qi in range(n_q_tests):
                 q_xk = jax.random.normal(
                     jax.random.PRNGKey(layer_id * 100 + qi),
-                    (DECODE_BATCH, NUM_HEADS, 1, HEAD_DIM), dtype=COMPUTE_DTYPE)
+                    (1, NUM_HEADS, 1, HEAD_DIM), dtype=COMPUTE_DTYPE)
                 
                 # Kernel 1: hotbuf (pre-gathered einsum)
                 out_hotbuf = hotbuf_decode_attn(q_xk, hot_k_xk, hot_v_xk)
