@@ -679,6 +679,162 @@ def make_decode_step_fn(schedule, use_sparse=False):
     return decode_step
 
 
+def autoregressive_generate(params, kv_caches, embed_table, start_token_id, 
+                            start_pos, freq_cis_full, num_steps, schedule,
+                            hot_k_stacked=None, hot_v_stacked=None,
+                            reuse_layer_ids=None, temperature=0.0):
+    """Autoregressive text generation with proper KV cache appending.
+    
+    Each step:
+      1. Embed the current token
+      2. Run decode step → get logits
+      3. Pick next token (greedy if temperature=0)
+      4. Compute K,V for the new token at each layer
+      5. Write K,V into the cache at the current position
+      6. Increment position
+    
+    Args:
+        params: model params dict (params_dict['params'])
+        kv_caches: dict[layer_id] -> (k, v) each [1, NUM_KV_HEADS, S, D]
+                   (mutable — will be updated in-place via dynamic_update_slice)
+        embed_table: [V, E] embedding table
+        start_token_id: int — first token to feed
+        start_pos: int — position in the sequence (= prefill length)
+        freq_cis_full: [max_S, D//2] — RoPE frequencies
+        num_steps: how many tokens to generate
+        schedule: layer schedule dict
+        hot_k_stacked, hot_v_stacked: optional hot buffers for REUSE layers
+        reuse_layer_ids: list of REUSE layer indices (for hot buffer indexing)
+        temperature: 0.0 = greedy, >0 = sampling
+    
+    Returns:
+        generated_tokens: list[int] of length num_steps
+        kv_caches: updated KV caches
+    """
+    generated = []
+    current_token = start_token_id
+    pos = start_pos
+    
+    # Build layer config (same logic as make_hotbuf_decode_step_fn)
+    layer_to_hot_idx = {}
+    if reuse_layer_ids:
+        for idx, lid in enumerate(reuse_layer_ids):
+            layer_to_hot_idx[lid] = idx
+    
+    for step in range(num_steps):
+        # 1. Embed current token: [1, 1, E]
+        x = embed_table[current_token][None, None, :]
+        
+        query_pos = jnp.array([pos], dtype=jnp.int32)
+        
+        # 2. RoPE for this position
+        freq_cis = jax.lax.dynamic_slice(
+            freq_cis_full,
+            (pos, jnp.int32(0)),
+            (1, freq_cis_full.shape[1]))
+        
+        # 3. Run through all layers (with KV cache update)
+        for i in range(NUM_LAYERS):
+            plan = schedule.get(i, {"type": "ANCHOR"})
+            if plan["type"] == "DENSE":
+                attn_key = 'DenseFullAttention_0'
+            elif plan["type"] == "ANCHOR":
+                attn_key = 'KascadeAnchorAttention_0'
+            else:
+                attn_key = 'KascadeReuseAttention_0'
+            
+            # Attention
+            scale_attn = params[f'layer_{i}']['attention_norm']['scale']
+            normed = rms_norm_fn(x, scale_attn)
+            
+            wq = params[f'layer_{i}'][attn_key]['Dense_0']['kernel']
+            wk = params[f'layer_{i}'][attn_key]['Dense_1']['kernel']
+            wv = params[f'layer_{i}'][attn_key]['Dense_2']['kernel']
+            wo = params[f'layer_{i}'][attn_key]['Dense_3']['kernel']
+            
+            # Compute Q, K, V for this token
+            # KV weights may be pre-expanded to 32 heads by convert_llama_weights.py
+            kv_heads_in_weight = wk.shape[-1] // HEAD_DIM
+            
+            q = (normed @ wq).reshape(1, 1, NUM_HEADS, HEAD_DIM)
+            q = jnp.transpose(q, (0, 2, 1, 3))  # [1, 32, 1, D]
+            
+            k_full = (normed @ wk).reshape(1, 1, kv_heads_in_weight, HEAD_DIM)
+            k_full = jnp.transpose(k_full, (0, 2, 1, 3))  # [1, kv_heads_in_weight, 1, D]
+            v_full = (normed @ wv).reshape(1, 1, kv_heads_in_weight, HEAD_DIM)
+            v_full = jnp.transpose(v_full, (0, 2, 1, 3))  # [1, kv_heads_in_weight, 1, D]
+            
+            # Apply RoPE to Q and K (at full head count)
+            k_dummy = jnp.zeros_like(q)
+            q, _ = apply_rope(q, k_dummy, freq_cis)
+            q_dummy = jnp.zeros_like(k_full)
+            _, k_full = apply_rope(q_dummy, k_full, freq_cis)
+            
+            # Downsample K,V to NUM_KV_HEADS for cache storage
+            if kv_heads_in_weight > NUM_KV_HEADS:
+                gqa_r = kv_heads_in_weight // NUM_KV_HEADS
+                k_new = k_full[:, ::gqa_r]  # [1, 8, 1, D]
+                v_new = v_full[:, ::gqa_r]  # [1, 8, 1, D]
+            else:
+                k_new = k_full
+                v_new = v_full
+            
+            # Write K,V into cache at position `pos`
+            k_cache, v_cache = kv_caches[i]
+            k_cache = jax.lax.dynamic_update_slice(
+                k_cache, k_new, (0, 0, pos, 0))
+            v_cache = jax.lax.dynamic_update_slice(
+                v_cache, v_new, (0, 0, pos, 0))
+            kv_caches[i] = (k_cache, v_cache)
+            
+            # Attention: Q @ KV cache
+            is_reuse = plan["type"] == "REUSE"
+            if is_reuse and hot_k_stacked is not None and i in layer_to_hot_idx:
+                # Use hot buffer for REUSE layers
+                hot_k = hot_k_stacked[layer_to_hot_idx[i]]
+                hot_v = hot_v_stacked[layer_to_hot_idx[i]]
+                attn_out = hotbuf_decode_attn(q, hot_k, hot_v)
+            else:
+                # Dense: attend to full KV cache
+                k_exp = jnp.repeat(k_cache, GQA_REPEATS, axis=1)
+                v_exp = jnp.repeat(v_cache, GQA_REPEATS, axis=1)
+                attn_out = dense_decode_attn(q, k_exp, v_exp, query_pos)
+            
+            attn_out = jnp.transpose(attn_out, (0, 2, 1, 3))
+            attn_out = attn_out.reshape(1, 1, NUM_HEADS * HEAD_DIM)
+            attn_out = attn_out @ wo
+            x = x + attn_out
+            
+            # MLP
+            scale_ffn = params[f'layer_{i}']['ffn_norm']['scale']
+            normed_ffn = rms_norm_fn(x, scale_ffn)
+            w_gate = params[f'layer_{i}']['gate_proj']['kernel']
+            w_up = params[f'layer_{i}']['up_proj']['kernel']
+            w_down = params[f'layer_{i}']['down_proj']['kernel']
+            gate = jax.nn.silu(normed_ffn @ w_gate)
+            up = normed_ffn @ w_up
+            x = x + (gate * up) @ w_down
+        
+        # Final norm + lm_head
+        scale_final = params['norm']['scale']
+        x = rms_norm_fn(x, scale_final)
+        logits = x @ params['output']['kernel']  # [1, 1, V]
+        
+        # 4. Pick next token
+        if temperature == 0.0:
+            next_token = int(jnp.argmax(logits[0, 0]))
+        else:
+            probs = jax.nn.softmax(logits[0, 0] / temperature)
+            next_token = int(jax.random.categorical(
+                jax.random.PRNGKey(step + pos), jnp.log(probs)))
+        
+        generated.append(next_token)
+        current_token = next_token
+        pos += 1
+    
+    return generated, kv_caches
+
+
 def _causal_attention(q, k, v):
     """Causal attention — delegates to kascade_layers.memory_efficient_causal_attention.
     
@@ -1464,6 +1620,219 @@ class LlamaModel(nn.Module):
         return x
 
 
+# ============================================================
+# MMLU BENCHMARK
+# ============================================================
+
+def evaluate_mmlu(params_dict, schedule, tokenizer, num_samples=200, device='tpu'):
+    """Evaluate MMLU accuracy: dense baseline vs Kascade sparse.
+    
+    MMLU is a multiple-choice benchmark (A/B/C/D) across 57 subjects.
+    For each question, we compare which answer the dense vs sparse model picks
+    by looking at the logits for tokens A, B, C, D at the last prompt position.
+    
+    This is a PREFILL-ONLY evaluation (no autoregressive generation).
+    """
+    import datasets
+    import collections
+    import contextlib, os
+    
+    @contextlib.contextmanager
+    def suppress_stderr():
+        """Suppress stderr to hide per-layer [SPARSE] Union density logs."""
+        stderr_fd = sys.stderr.fileno()
+        saved_fd = os.dup(stderr_fd)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stderr_fd)
+        os.close(devnull)
+        try:
+            yield
+        finally:
+            os.dup2(saved_fd, stderr_fd)
+            os.close(saved_fd)
+    
+    print(f"\n{'='*70}")
+    print(f"  MMLU ACCURACY BENCHMARK")
+    print(f"{'='*70}")
+    
+    # Get token IDs for A, B, C, D in LLaMA tokenizer
+    answer_tokens = {}
+    for letter in ['A', 'B', 'C', 'D']:
+        ids = tokenizer.encode(letter, add_special_tokens=False)
+        answer_tokens[letter] = ids[-1]  # Take the last token (handles BPE)
+    print(f"\n  Answer token IDs: {answer_tokens}")
+    
+    # Load MMLU dataset
+    print(f"  Loading MMLU dataset...")
+    try:
+        mmlu_ds = datasets.load_dataset("cais/mmlu", "all", split="test")
+    except Exception:
+        try:
+            mmlu_ds = datasets.load_dataset("lighteval/mmlu", "all", split="test")
+        except Exception:
+            print("  ❌ Could not load MMLU dataset. Skipping.")
+            return
+    
+    total_questions = len(mmlu_ds)
+    if num_samples > 0:
+        # Sample evenly across dataset
+        step = max(1, total_questions // num_samples)
+        indices = list(range(0, total_questions, step))[:num_samples]
+    else:
+        indices = list(range(total_questions))
+        num_samples = total_questions
+    
+    print(f"  Evaluating {len(indices)} / {total_questions} questions")
+    
+    # Build dense and sparse models
+    dense_schedule = {i: {"type": "DENSE"} for i in range(NUM_LAYERS)}
+    model_dense = LlamaModel(schedule=dense_schedule, use_splash=False)
+    model_sparse = LlamaModel(schedule=schedule, use_splash=USE_SPLASH_KERNEL,
+                              force_sparse=True)
+    
+    # Prompt template (0-shot)
+    def format_prompt(example):
+        subject = example.get('subject', 'general knowledge').replace('_', ' ')
+        question = example['question']
+        choices = example['choices']
+        choices_text = '\n'.join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
+        return (f"The following are multiple choice questions (with answers) "
+                f"about {subject}.\n\n{question}\n{choices_text}\nAnswer:")
+    
+    # Evaluate
+    dense_correct = 0
+    sparse_correct = 0
+    agreement = 0  # Both pick the same answer
+    total = 0
+    category_stats = collections.defaultdict(lambda: {'dense_correct': 0, 'sparse_correct': 0, 'total': 0})
+    
+    # Determine actual tile_size/top_k for short sequences
+    # MMLU prompts are ~200 tokens. At tile_size=128, that's 1-4 tiles.
+    # Kascade will operate at high density (>50%) on short prompts.
+    
+    answer_token_ids = jnp.array([answer_tokens[c] for c in ['A', 'B', 'C', 'D']])  # [4]
+    
+    print(f"\n  {'Progress':12s}  {'Dense':>8s}  {'Sparse':>8s}  {'Agree':>8s}")
+    print(f"  {'-'*12}  {'-'*8}  {'-'*8}  {'-'*8}")
+    
+    for i, idx in enumerate(indices):
+        example = mmlu_ds[idx]
+        prompt = format_prompt(example)
+        raw_answer = example['answer']
+        # Handle both cais/mmlu (answer="D") and lighteval/mmlu (answer=3)
+        if isinstance(raw_answer, str):
+            label = ord(raw_answer.upper()) - ord('A')  # "D" -> 3
+        else:
+            label = int(raw_answer)  # 3
+        
+        # Tokenize
+        token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        
+        # Pad to nearest multiple of tile_size (min 128 for TPU)
+        pad_to = max(128, ((len(token_ids) + 127) // 128) * 128)
+        if len(token_ids) > pad_to:
+            token_ids = token_ids[:pad_to]  # Truncate if too long
+        else:
+            # Pad with 0 (will be masked by causal attention anyway)
+            token_ids = token_ids + [0] * (pad_to - len(token_ids))
+        
+        prompt_len = len(tokenizer.encode(prompt, add_special_tokens=True))  # Unpadded length
+        last_pos = min(prompt_len - 1, pad_to - 1)  # Last real token position
+        
+        input_ids = jnp.array([token_ids], dtype=jnp.int32)  # [1, padded_len]
+        
+        # Save/restore globals for MMLU sequence length
+        global TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN
+        saved_ts, saved_tk, saved_sl = TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN
+        mmlu_tiles = pad_to // 128
+        TILE_SIZE = 128
+        TOP_K_OPTIMIZED = max(1, mmlu_tiles // 2)  # 50% for short seq
+        SEQ_LEN = pad_to
+        
+        try:
+            # Dense forward
+            KASCADE_CACHE.clear()
+            dense_logits = model_dense.apply(params_dict, input_ids)  # [1, S, V]
+            dense_last = dense_logits[0, last_pos, :]  # [V]
+            dense_answer_logits = dense_last[answer_token_ids]  # [4]
+            dense_pred = int(jnp.argmax(dense_answer_logits))  # 0-3
+            del dense_logits, dense_last, dense_answer_logits
+            
+            # Sparse forward (suppress per-layer density logs)
+            KASCADE_CACHE.clear()
+            with suppress_stderr():
+                sparse_logits = model_sparse.apply(params_dict, input_ids)  # [1, S, V]
+            sparse_last = sparse_logits[0, last_pos, :]  # [V]
+            sparse_answer_logits = sparse_last[answer_token_ids]  # [4]
+            sparse_pred = int(jnp.argmax(sparse_answer_logits))  # 0-3
+            del sparse_logits, sparse_last, sparse_answer_logits
+        finally:
+            TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN = saved_ts, saved_tk, saved_sl
+        
+        if dense_pred == label:
+            dense_correct += 1
+        if sparse_pred == label:
+            sparse_correct += 1
+        if dense_pred == sparse_pred:
+            agreement += 1
+        total += 1
+        
+        # Track per-category
+        subject = example.get('subject', 'unknown')
+        cat_stat = category_stats[subject]
+        cat_stat['total'] += 1
+        if dense_pred == label:
+            cat_stat['dense_correct'] += 1
+        if sparse_pred == label:
+            cat_stat['sparse_correct'] += 1
+        
+        # Progress update every 25 questions
+        if (i + 1) % 25 == 0 or (i + 1) == len(indices):
+            d_acc = dense_correct / total * 100
+            s_acc = sparse_correct / total * 100
+            a_pct = agreement / total * 100
+            print(f"  {total:4d}/{len(indices):4d}    {d_acc:6.1f}%  {s_acc:6.1f}%  {a_pct:6.1f}%")
+    
+    # Final results
+    d_acc = dense_correct / total * 100
+    s_acc = sparse_correct / total * 100
+    a_pct = agreement / total * 100
+    
+    print(f"\n  {'='*58}")
+    print(f"  MMLU RESULTS  ({total} questions)")
+    print(f"  {'='*58}")
+    print(f"   Dense accuracy:    {d_acc:.1f}%  ({dense_correct}/{total})")
+    print(f"   Sparse accuracy:   {s_acc:.1f}%  ({sparse_correct}/{total})")
+    print(f"   Agreement:         {a_pct:.1f}%  ({agreement}/{total} same answer)")
+    print(f"   Accuracy gap:      {abs(d_acc - s_acc):.2f}%")
+    
+    if abs(d_acc - s_acc) < 1.0:
+        print(f"   ✅ <1% accuracy gap — Kascade matches dense baseline")
+    elif abs(d_acc - s_acc) < 2.0:
+        print(f"   ✅ <2% accuracy gap — minimal degradation")
+    elif abs(d_acc - s_acc) < 5.0:
+        print(f"   ⚠️  <5% accuracy gap — moderate degradation")
+    else:
+        print(f"   ❌ {abs(d_acc - s_acc):.1f}% accuracy gap")
+    
+    # Top-5 subjects by count
+    subjects_by_count = sorted(category_stats.items(), key=lambda x: x[1]['total'], reverse=True)
+    if len(subjects_by_count) > 5:
+        print(f"\n   Top subjects:")
+        for subj, stats in subjects_by_count[:10]:
+            st = stats['total']
+            da = stats['dense_correct'] / st * 100 if st > 0 else 0
+            sa = stats['sparse_correct'] / st * 100 if st > 0 else 0
+            print(f"     {subj:35s}  dense={da:5.1f}%  sparse={sa:5.1f}%  (n={st})")
+    
+    # Cleanup
+    del model_dense, model_sparse
+    KASCADE_CACHE.clear()
+    import gc; gc.collect()
+    
+    return d_acc, s_acc, a_pct
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Kascade Sparse Attention Benchmark (Long Sequence Edition)",
@@ -1493,6 +1862,10 @@ def parse_args():
         help="Batch size for decode benchmark (higher = more KV dominated)")
     parser.add_argument("--bf16", action="store_true", default=False,
         help="Use bfloat16 for weights and activations (recommended for TPU, required for seq_len>=16K)")
+    parser.add_argument("--mmlu", action="store_true", default=False,
+        help="Run MMLU accuracy benchmark: dense vs Kascade sparse")
+    parser.add_argument("--mmlu_samples", type=int, default=200,
+        help="Number of MMLU questions to evaluate (default: 200, use 0 for all ~14K)")
     return parser.parse_args()
 
 
@@ -2498,6 +2871,66 @@ def main():
         else:
             print(f"\n   ❌ Hot buffer prefill not available")
         
+        # ================================================
+        # AUTOREGRESSIVE GENERATION COMPARISON
+        # ================================================
+        # Generate tokens with dense vs sparse (hotbuf) decode,
+        # properly appending each token's K,V to the cache.
+        print(f"\n  {'='*58}")
+        print(f"  AUTOREGRESSIVE GENERATION  ({args.decode_steps} tokens, S={DECODE_SEQ_LEN:,})")
+        print(f"  {'='*58}")
+        
+        embed_table = params['tok_embeddings']['embedding']
+        gen_start_pos = DECODE_SEQ_LEN - 1  # Start generating from last prefill position
+        gen_start_token = int(prefill_ids[0, gen_start_pos - 1])  # Token before last
+        
+        # Dense schedule (all layers full attention)
+        dense_schedule_gen = {i: {"type": "DENSE"} for i in range(NUM_LAYERS)}
+        
+        # Run dense first, then free its KV copy before sparse
+        kv_dense = {k: (jnp.array(kk), jnp.array(vv)) for k, (kk, vv) in kv_caches.items()}
+        print(f"   Generating {args.decode_steps} tokens with dense decode...")
+        dense_gen, kv_dense = autoregressive_generate(
+            params, kv_dense, embed_table, gen_start_token, gen_start_pos,
+            freq_cis_full, args.decode_steps, dense_schedule_gen)
+        del kv_dense  # Free ~1.1 GB before allocating sparse copy
+        
+        kv_sparse = {k: (jnp.array(kk), jnp.array(vv)) for k, (kk, vv) in kv_caches.items()}
+        print(f"   Generating {args.decode_steps} tokens with Kascade sparse decode...")
+        sparse_gen, kv_sparse = autoregressive_generate(
+            params, kv_sparse, embed_table, gen_start_token, gen_start_pos,
+            freq_cis_full, args.decode_steps, schedule,
+            hot_k_stacked=hot_k_stacked, hot_v_stacked=hot_v_stacked,
+            reuse_layer_ids=reuse_layer_ids)
+        del kv_sparse
+        
+        # Compare generated sequences
+        match_count = sum(1 for d, s in zip(dense_gen, sparse_gen) if d == s)
+        match_pct = match_count / len(dense_gen) * 100
+        first_diff = next((i for i, (d, s) in enumerate(zip(dense_gen, sparse_gen)) if d != s), -1)
+        
+        # Decode to text for display
+        dense_text = tokenizer.decode(dense_gen[:50])
+        sparse_text = tokenizer.decode(sparse_gen[:50])
+        
+        print(f"\n   Token match rate: {match_count}/{len(dense_gen)} ({match_pct:.0f}%)")
+        if first_diff >= 0:
+            print(f"   First divergence: step {first_diff} "
+                  f"(dense={dense_gen[first_diff]}, sparse={sparse_gen[first_diff]})")
+        else:
+            print(f"   First divergence: NONE — identical sequences!")
+        print(f"\n   Dense output:  {dense_text[:120]}{'...' if len(dense_text) > 120 else ''}")
+        print(f"   Sparse output: {sparse_text[:120]}{'...' if len(sparse_text) > 120 else ''}")
+        
+        if match_pct == 100:
+            print(f"\n   ✅ Perfect match — Kascade produces identical generation")
+        elif match_pct >= 80:
+            print(f"\n   ✅ {match_pct:.0f}% match — minor divergence (expected with sparse approximation)")
+        elif match_pct >= 50:
+            print(f"\n   ⚠️  {match_pct:.0f}% match — moderate divergence")
+        else:
+            print(f"\n   ❌ {match_pct:.0f}% match — significant divergence")
+        
         # Summary
         print(f"\n  {'='*58}")
         print(f"  DECODE SUMMARY  (B={DECODE_BATCH}, S={DECODE_SEQ_LEN:,})")
@@ -2510,6 +2943,8 @@ def main():
               f"(kernel working correctly)")
         print(f"   E2E speedup:       {speedup_med:.2f}x  "
               f"(B={DECODE_BATCH}, S={DECODE_SEQ_LEN:,})")
+        print(f"   Generation match:  {match_pct:.0f}%  "
+              f"({match_count}/{len(dense_gen)} tokens, autoregressive)")
         if not args.decode_only:
             print(f"   Prefill speedup:   {prefill_speedup_measured:.2f}x  "
                   f"(sparse prefill is {prefill_attn_pct:.1f}% faster)")
@@ -2518,6 +2953,13 @@ def main():
         if attn_speedup_med > 1.5 and speedup_med < 1.1 and DECODE_BATCH == 1:
             print(f"\n   The {attn_speedup_med:.1f}x attention speedup is real but hidden")
             print(f"   behind {total_weight_mb:.0f} MB of weight loads that dominate B=1 decode.")
+    
+    # ==========================================================
+    # MMLU ACCURACY BENCHMARK (optional, --mmlu flag)
+    # ==========================================================
+    if args.mmlu:
+        evaluate_mmlu(params_dict, schedule, tokenizer,
+                      num_samples=args.mmlu_samples, device=args.device)
     
     print("\n" + "=" * 70)
 
