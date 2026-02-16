@@ -1887,10 +1887,47 @@ def main():
           print(f"     Full attention matrix: {full_attn_gb:.1f} GB per layer (OOM!)")
           print(f"     Hot buffer matrix:     {hot_attn_gb:.2f} GB per layer (fits)")
 
+      # --- Build KV caches for decode (reuse prefill computation) ---
+      # When --decode is also specified, build KV caches HERE so we don't
+      # repeat the full prefill in the decode section below.
+      # Uses the same ppl_ids (= decode_text_ids[:, :decode_seq_len]) that
+      # the Flax PPL eval just processed.
+      _prefill_kv_caches = None
+      _prefill_ppl_decode = None
+      _prefill_tile_indices_map = None
+      _prefill_ids = None
+      if args.decode and args.decode_seq_len and args.decode_seq_len > 0:
+          _decode_ts, _decode_tk = auto_params(args.decode_seq_len)
+          print(f"\n  Building KV caches for decode (S={args.decode_seq_len:,})...")
+          # Prepare input_ids (same as what decode section would use)
+          if args.decode_seq_len <= decode_text_ids.shape[1]:
+              _prefill_ids = decode_text_ids[:, :args.decode_seq_len]
+          else:
+              _pad_len = args.decode_seq_len - decode_text_ids.shape[1]
+              _prefill_ids = jnp.concatenate([
+                  decode_text_ids,
+                  jnp.zeros((1, _pad_len), dtype=jnp.int32)], axis=1)
+          # Override globals for hotbuf_prefill (uses TILE_SIZE, TOP_K_OPTIMIZED)
+          TILE_SIZE, TOP_K_OPTIMIZED = ppl_ts, ppl_tk
+          _prefill_kv_caches, _prefill_ppl_decode, _prefill_tile_indices_map = \
+              hotbuf_prefill_build_kv_caches(
+                  params, _prefill_ids,
+                  schedule=schedule,
+                  tile_indices_full_map=tile_indices_full_map if tile_indices_full_map else {},
+                  decode_tile_size=_decode_ts,
+                  decode_top_k=_decode_tk)
+          TILE_SIZE, TOP_K_OPTIMIZED = saved_ts, saved_tk
+          import gc; gc.collect()
+          print(f"   KV caches built: {len(_prefill_kv_caches)} layers, PPL={_prefill_ppl_decode:.4f}")
+
     else:
       # decode_only mode — no PPL, no timing
       prefill_speedup_measured = 0.0
       prefill_attn_pct = 0.0
+      _prefill_kv_caches = None
+      _prefill_ppl_decode = None
+      _prefill_tile_indices_map = None
+      _prefill_ids = None
     
     # ==========================================================
     # DECODE BENCHMARK (Hot Buffer Sparse Decode vs Dense)
@@ -1919,28 +1956,38 @@ def main():
         print(f"  DECODE BENCHMARK  (Batch={DECODE_BATCH}, SeqLen={DECODE_SEQ_LEN:,})")
         print("=" * 70)
         
-        # --- Build KV caches via REAL PREFILL at DECODE_SEQ_LEN ---
-        # Always prefill on real text to fill KV caches with real activations.
-        # Also computes real tile indices from anchor Q,K activations.
-        print(f"\n  Running prefill on real text (S={DECODE_SEQ_LEN:,})...")
-        
-        # Prepare input_ids at DECODE_SEQ_LEN
-        if DECODE_SEQ_LEN <= decode_text_ids.shape[1]:
-            prefill_ids = decode_text_ids[:, :DECODE_SEQ_LEN]
+        # --- Reuse or build KV caches ---
+        # If PPL eval already built KV caches (same data, same seq_len), reuse them
+        # to avoid a redundant full prefill pass.
+        if (_prefill_kv_caches is not None
+                and _prefill_ids is not None
+                and _prefill_ids.shape[1] == DECODE_SEQ_LEN):
+            print(f"\n  Reusing KV caches from PPL eval (same data, S={DECODE_SEQ_LEN:,})...")
+            kv_caches = _prefill_kv_caches
+            prefill_ppl_decode = _prefill_ppl_decode
+            tile_indices_map = _prefill_tile_indices_map
+            prefill_ids = _prefill_ids
+            # Free the temporary references
+            del _prefill_kv_caches, _prefill_ppl_decode, _prefill_tile_indices_map, _prefill_ids
         else:
-            # Pad with first tokens if not enough (shouldn't happen with enough text)
-            pad_len = DECODE_SEQ_LEN - decode_text_ids.shape[1]
-            prefill_ids = jnp.concatenate([
-                decode_text_ids,
-                jnp.zeros((1, pad_len), dtype=jnp.int32)], axis=1)
-            print(f"   ⚠ Padded {pad_len} tokens (only had {decode_text_ids.shape[1]:,})")
-        
-        kv_caches, prefill_ppl_decode, tile_indices_map = hotbuf_prefill_build_kv_caches(
-            params, prefill_ids,
-            schedule=schedule,
-            tile_indices_full_map=tile_indices_full_map if tile_indices_full_map else {},
-            decode_tile_size=decode_ts,
-            decode_top_k=decode_tk)
+            # Build KV caches via REAL PREFILL at DECODE_SEQ_LEN
+            # (decode_only mode, or different seq_len from PPL eval)
+            print(f"\n  Running prefill on real text (S={DECODE_SEQ_LEN:,})...")
+            if DECODE_SEQ_LEN <= decode_text_ids.shape[1]:
+                prefill_ids = decode_text_ids[:, :DECODE_SEQ_LEN]
+            else:
+                pad_len = DECODE_SEQ_LEN - decode_text_ids.shape[1]
+                prefill_ids = jnp.concatenate([
+                    decode_text_ids,
+                    jnp.zeros((1, pad_len), dtype=jnp.int32)], axis=1)
+                print(f"   ⚠ Padded {pad_len} tokens (only had {decode_text_ids.shape[1]:,})")
+            
+            kv_caches, prefill_ppl_decode, tile_indices_map = hotbuf_prefill_build_kv_caches(
+                params, prefill_ids,
+                schedule=schedule,
+                tile_indices_full_map=tile_indices_full_map if tile_indices_full_map else {},
+                decode_tile_size=decode_ts,
+                decode_top_k=decode_tk)
         
         # Free compilation artifacts (prefill_ids kept for sanity check)
         import gc; gc.collect()
