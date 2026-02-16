@@ -1833,6 +1833,307 @@ def evaluate_mmlu(params_dict, schedule, tokenizer, num_samples=200, device='tpu
     return d_acc, s_acc, a_pct
 
 
+# ============================================================
+# NEEDLE IN A HAYSTACK (NIAH) BENCHMARK
+# ============================================================
+
+# Pre-defined needles: (needle_sentence, retrieval_question, expected_answer_prefix)
+# NIAH needles use a *verbatim-repeat* format so that even a 1B model can
+# succeed.  The question repeats the first half of the needle sentence
+# verbatim, and the model only needs to *continue* with the second half
+# it already saw in context.  This isolates **attention retrieval** from
+# model reasoning ability — exactly what we want to test.
+#
+# Format: (needle_sentence, prompt_that_repeats_start, expected_continuation)
+NIAH_NEEDLES = [
+    (
+        "The special magic number for this test is seven four two nine three.",
+        "\n\nRepeat: The special magic number for this test is",
+        " seven",
+    ),
+    (
+        "The secret ingredient in the recipe is freshly ground cardamom pods.",
+        "\n\nRepeat: The secret ingredient in the recipe is",
+        " freshly",
+    ),
+    (
+        "The hidden password to access the vault is blue dolphin sunset.",
+        "\n\nRepeat: The hidden password to access the vault is",
+        " blue",
+    ),
+    (
+        "The best sandwich in the world is made with sourdough bread and fig jam.",
+        "\n\nRepeat: The best sandwich in the world is made with",
+        " sourdough",
+    ),
+    (
+        "The capital of the fictional country of Zenthoria is the city of Luminara.",
+        "\n\nRepeat: The capital of the fictional country of Zenthoria is the city of",
+        " Luminara",
+    ),
+]
+
+
+def evaluate_niah(params_dict, schedule, tokenizer, haystack_ids,
+                  depths=None, num_needles=5, device='tpu'):
+    """Needle In A Haystack: test long-context retrieval at various depths.
+    
+    Inserts a synthetic fact ("needle") at different positions in a long
+    context ("haystack") and checks whether the model can retrieve it
+    when prompted at the end. Compares dense vs Kascade sparse.
+    
+    This directly tests whether 10% top-k tile selection preserves the
+    ability to find specific information buried in 32K+ tokens.
+    
+    Args:
+        params_dict: model parameters
+        schedule: Kascade layer schedule
+        tokenizer: LLaMA tokenizer
+        haystack_ids: [1, S] token IDs of the haystack text (C4)
+        depths: list of depth fractions (0.0=start, 1.0=end) to test
+        num_needles: number of different needle sentences to test
+        device: 'tpu', 'gpu', or 'cpu'
+    """
+    import contextlib, os
+    
+    @contextlib.contextmanager
+    def suppress_stderr():
+        """Suppress stderr to hide per-layer [SPARSE] Union density logs."""
+        stderr_fd = sys.stderr.fileno()
+        saved_fd = os.dup(stderr_fd)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stderr_fd)
+        os.close(devnull)
+        try:
+            yield
+        finally:
+            os.dup2(saved_fd, stderr_fd)
+            os.close(saved_fd)
+    
+    if depths is None:
+        depths = [0.1, 0.25, 0.5, 0.75, 0.9]
+    
+    # Cap haystack at 2K to fit in residual HBM after decode benchmark.
+    # ANCHOR layers compute full Q×K scores [1, 32, S, S] in bf16 to
+    # select top-k tiles.  At S=4K that's 2 GB — after 8+ iterations
+    # XLA memory fragmentation leaves <2 GB contiguous.  At S=2K the
+    # scores are only 512 MB which fits comfortably.  2K still exercises
+    # meaningful sparsity (16 tiles, top-k 2 = 12.5%) — the model must
+    # find the needle tile among 16 candidates using only 256 KV tokens
+    # per REUSE layer.
+    NIAH_MAX_LEN = 2048
+    if haystack_ids.shape[1] > NIAH_MAX_LEN:
+        haystack_ids = haystack_ids[:, :NIAH_MAX_LEN]
+    
+    haystack_len = haystack_ids.shape[1]
+    needles_to_use = NIAH_NEEDLES[:num_needles]
+    
+    print(f"\n{'='*70}")
+    print(f"  NEEDLE IN A HAYSTACK (NIAH) BENCHMARK")
+    print(f"{'='*70}")
+    print(f"\n  Config:")
+    print(f"   Haystack length:  {haystack_len:,} tokens")
+    print(f"   Depths tested:    {depths}")
+    print(f"   Needles:          {len(needles_to_use)}")
+    print(f"   Total tests:      {len(depths) * len(needles_to_use)}")
+    niah_tiles_est = haystack_len // 128
+    niah_topk_est = max(2, niah_tiles_est // 10)
+    print(f"   Sparsity:         {niah_topk_est}/{niah_tiles_est} tiles = "
+          f"{niah_topk_est*128*100/haystack_len:.1f}% (top-k at 10%)")
+    if NIAH_MAX_LEN < 32768:
+        mask_est_mb = (niah_tiles_est * niah_tiles_est * 4) / (1024 * 1024)
+        print(f"   Note:             Haystack capped at {NIAH_MAX_LEN//1024}K "
+              f"to fit in HBM after decode (mask ≈ {mask_est_mb:.0f} MB)")
+    
+    # At 4K both dense and sparse models fit in residual HBM
+    # (no SplashAttention mask at 4K, MLP intermediates only ~128 MB each)
+    model_dense  = LlamaModel(schedule=schedule, use_splash=False,
+                              force_sparse=False)
+    model_sparse = LlamaModel(schedule=schedule, use_splash=USE_SPLASH_KERNEL,
+                              force_sparse=True)
+    
+    # Decode the haystack text for display
+    haystack_tokens = haystack_ids[0].tolist()
+    
+    results = []
+    dense_total_correct = 0
+    sparse_total_correct = 0
+    total_tests = 0
+    
+    print(f"\n  {'Depth':>6s}  {'Needle':>3s}  {'Dense':>12s}  {'Sparse':>12s}  {'Expected':>20s}")
+    print(f"  {'-'*6}  {'-'*3}  {'-'*12}  {'-'*12}  {'-'*20}")
+    
+    for depth in depths:
+        for needle_idx, (needle_text, question, expected_prefix) in enumerate(needles_to_use):
+            # Tokenize needle and question
+            needle_tokens = tokenizer.encode(
+                f" {needle_text} ", add_special_tokens=False)
+            question_tokens = tokenizer.encode(
+                f"\n\n{question}", add_special_tokens=False)
+            
+            # Calculate insertion position in haystack
+            # Trim haystack so total (before + needle + after + question) = original length
+            # This avoids creating a sequence longer than the haystack
+            target_len = haystack_len  # keep total within original haystack size
+            available_for_haystack = target_len - len(needle_tokens) - len(question_tokens)
+            if available_for_haystack < 128:
+                print(f"   ⚠ Haystack too short for depth={depth}, needle={needle_idx}")
+                continue
+            
+            insert_pos = int(available_for_haystack * depth)
+            insert_pos = max(1, insert_pos)
+            
+            # Build: [haystack_before | needle | haystack_after | question]
+            before = haystack_tokens[:insert_pos]
+            after = haystack_tokens[insert_pos:available_for_haystack]
+            
+            combined_tokens = before + needle_tokens + after + question_tokens
+            
+            # Pad to nearest multiple of 128 (for TPU tile alignment)
+            pad_to = ((len(combined_tokens) + 127) // 128) * 128
+            prompt_len = len(combined_tokens)
+            combined_tokens = combined_tokens + [0] * (pad_to - len(combined_tokens))
+            
+            input_ids = jnp.array([combined_tokens], dtype=jnp.int32)
+            last_pos = prompt_len - 1
+            
+            # Save/restore globals for this sequence length
+            global TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN
+            saved_ts, saved_tk, saved_sl = TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN
+            niah_tiles = pad_to // 128
+            TILE_SIZE = 128
+            # Use same top_k ratio as the main benchmark (10%)
+            TOP_K_OPTIMIZED = max(2, niah_tiles // 10)
+            SEQ_LEN = pad_to
+            
+            try:
+                # Tokenize expected answer for checking
+                expected_tokens = tokenizer.encode(
+                    expected_prefix, add_special_tokens=False)
+                # We only need the first token of the expected answer
+                expected_first_token = expected_tokens[0] if expected_tokens else None
+                expected_first_word = tokenizer.decode([expected_first_token]).strip() if expected_first_token else "?"
+                
+                # --- Dense forward pass (baseline) ---
+                # Use forward_hidden + last-token projection to avoid
+                # materializing full [1, S, VOCAB] logits (~1 GB at 4K).
+                KASCADE_CACHE.clear()
+                lm_head = params_dict['params']['output']['kernel']
+                dense_hidden = model_dense.apply(
+                    params_dict, input_ids, method=model_dense.forward_hidden)
+                dense_last_logits = dense_hidden[0, last_pos, :] @ lm_head
+                del dense_hidden
+                
+                dense_top5_ids = jnp.argsort(dense_last_logits)[-5:][::-1]
+                dense_top5 = dense_top5_ids.block_until_ready().tolist()
+                dense_top5_tokens = [tokenizer.decode([t]).strip() for t in dense_top5]
+                dense_correct = (expected_first_token is not None and
+                                expected_first_token in dense_top5)
+                del dense_last_logits, dense_top5_ids
+                
+                # Free before sparse run
+                KASCADE_CACHE.clear()
+                import gc; gc.collect()
+                
+                # --- Sparse forward pass (Kascade) ---
+                with suppress_stderr():
+                    sparse_hidden = model_sparse.apply(
+                        params_dict, input_ids, method=model_sparse.forward_hidden)
+                    sparse_last_logits = sparse_hidden[0, last_pos, :] @ lm_head
+                    del sparse_hidden
+                
+                sparse_top5_ids = jnp.argsort(sparse_last_logits)[-5:][::-1]
+                sparse_top5 = sparse_top5_ids.block_until_ready().tolist()
+                sparse_top5_tokens = [tokenizer.decode([t]).strip() for t in sparse_top5]
+                sparse_correct = (expected_first_token is not None and 
+                                 expected_first_token in sparse_top5)
+                del sparse_last_logits, sparse_top5_ids
+                
+                # Clear tile-index cache but keep JIT cache — all iterations
+                # use the same input shape so compiled programs are reused.
+                # jax.clear_caches() here would force recompilation each
+                # iteration, creating temporary buffers that fragment HBM.
+                KASCADE_CACHE.clear()
+                gc.collect()
+                
+            finally:
+                TILE_SIZE, TOP_K_OPTIMIZED, SEQ_LEN = saved_ts, saved_tk, saved_sl
+            
+            # Track results
+            d_ok = "✅ found" if dense_correct else "❌ miss"
+            s_ok = "✅ found" if sparse_correct else "❌ miss"
+            
+            if dense_correct:
+                dense_total_correct += 1
+            if sparse_correct:
+                sparse_total_correct += 1
+            total_tests += 1
+            
+            print(f"  {depth:5.0%}   N{needle_idx+1}   {d_ok:>12s}  {s_ok:>12s}  {expected_first_word:>20s}")
+            
+            results.append({
+                'depth': depth,
+                'needle_idx': needle_idx,
+                'dense_correct': dense_correct,
+                'dense_top5': dense_top5_tokens,
+                'sparse_correct': sparse_correct,
+                'sparse_top5': sparse_top5_tokens,
+                'expected': expected_first_word,
+                'seq_len': pad_to,
+                'top_k_tiles': niah_topk_est,
+            })
+    
+    # Summary
+    d_acc = dense_total_correct / total_tests * 100 if total_tests > 0 else 0
+    s_acc = sparse_total_correct / total_tests * 100 if total_tests > 0 else 0
+    agreement = sum(1 for r in results
+                    if r['dense_correct'] == r['sparse_correct']) / total_tests * 100 \
+                if total_tests > 0 else 0
+    
+    print(f"\n  {'='*58}")
+    print(f"  NIAH RESULTS  ({total_tests} tests, S={haystack_len:,})")
+    print(f"  {'='*58}")
+    print(f"   Dense retrieval:   {d_acc:.1f}%  ({dense_total_correct}/{total_tests})")
+    print(f"   Sparse retrieval:  {s_acc:.1f}%  ({sparse_total_correct}/{total_tests})")
+    print(f"   Agreement:         {agreement:.1f}%  (dense & sparse same verdict)")
+    print(f"   Sparsity:          {niah_topk_est}/{niah_tiles_est} tiles "
+          f"= {niah_topk_est*128*100/haystack_len:.1f}%")
+    
+    if s_acc >= d_acc - 10:
+        print(f"   ✅ Sparse matches dense retrieval (within 10pp) at "
+              f"{niah_topk_est*128*100/haystack_len:.0f}% sparsity")
+    elif s_acc >= 50:
+        print(f"   ⚠️  Partial retrieval — sparse {s_acc:.0f}% vs dense {d_acc:.0f}%")
+    else:
+        print(f"   ❌ Poor sparse retrieval ({s_acc:.0f}%) vs dense ({d_acc:.0f}%)")
+    
+    # Per-depth breakdown
+    print(f"\n   Per-depth breakdown:")
+    print(f"     {'Depth':>8s}  {'Dense':>8s}  {'Sparse':>8s}")
+    for depth in depths:
+        depth_results = [r for r in results if r['depth'] == depth]
+        if not depth_results:
+            continue
+        d_hits = sum(1 for r in depth_results if r['dense_correct'])
+        s_hits = sum(1 for r in depth_results if r['sparse_correct'])
+        n = len(depth_results)
+        print(f"     {depth:7.0%}:  {d_hits}/{n}       {s_hits}/{n}")
+    
+    # Show a few example predictions
+    print(f"\n   Sample predictions (top-3 tokens):")
+    for r in results[:3]:
+        print(f"     Depth {r['depth']:.0%}, N{r['needle_idx']+1}: "
+              f"dense={r['dense_top5'][:3]}  sparse={r['sparse_top5'][:3]}  "
+              f"expected='{r['expected']}'")
+    
+    # Cleanup
+    del model_dense, model_sparse
+    KASCADE_CACHE.clear()
+    import gc; gc.collect()
+    
+    return d_acc, s_acc, agreement
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Kascade Sparse Attention Benchmark (Long Sequence Edition)",
@@ -1866,6 +2167,10 @@ def parse_args():
         help="Run MMLU accuracy benchmark: dense vs Kascade sparse")
     parser.add_argument("--mmlu_samples", type=int, default=200,
         help="Number of MMLU questions to evaluate (default: 200, use 0 for all ~14K)")
+    parser.add_argument("--niah", action="store_true", default=False,
+        help="Run Needle In A Haystack retrieval test (uses decode_seq_len context)")
+    parser.add_argument("--niah_needles", type=int, default=5,
+        help="Number of different needle sentences to test (max 5)")
     return parser.parse_args()
 
 
@@ -2954,12 +3259,48 @@ def main():
             print(f"\n   The {attn_speedup_med:.1f}x attention speedup is real but hidden")
             print(f"   behind {total_weight_mb:.0f} MB of weight loads that dominate B=1 decode.")
     
+    # Free decode-phase memory before MMLU/NIAH
+    # These large tensors from the decode benchmark would cause OOM
+    # when NIAH tries to run full 32K forward passes
+    try:
+        del kv_caches, hot_k_stacked, hot_v_stacked
+    except NameError:
+        pass
+    try:
+        del k_full_test, v_full_test, hot_k_test, hot_v_test, q_test
+    except NameError:
+        pass
+    try:
+        del token_embed, jit_dense, jit_hotbuf, freq_cis_full
+    except NameError:
+        pass
+    try:
+        del hot_kv_map
+    except NameError:
+        pass
+    import gc; gc.collect()
+    jax.clear_caches()  # Release XLA compiled programs from decode benchmark
+
     # ==========================================================
     # MMLU ACCURACY BENCHMARK (optional, --mmlu flag)
     # ==========================================================
     if args.mmlu:
         evaluate_mmlu(params_dict, schedule, tokenizer,
                       num_samples=args.mmlu_samples, device=args.device)
+    
+    # ==========================================================
+    # NEEDLE IN A HAYSTACK (optional, --niah flag)
+    # ==========================================================
+    if args.niah:
+        # Use decode_text_ids as haystack (longest available context)
+        niah_haystack = decode_text_ids
+        if niah_haystack.shape[1] < 1024:
+            print("\n  ⚠ Haystack too short for NIAH. Use --decode_seq_len 32768 or higher.")
+        else:
+            evaluate_niah(params_dict, schedule, tokenizer,
+                         haystack_ids=niah_haystack,
+                         num_needles=min(args.niah_needles, len(NIAH_NEEDLES)),
+                         device=args.device)
     
     print("\n" + "=" * 70)
 
