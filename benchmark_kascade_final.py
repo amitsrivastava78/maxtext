@@ -49,6 +49,20 @@ TOKAMAX_SPLASH_AVAILABLE = getattr(kascade_module, 'TOKAMAX_SPLASH_AVAILABLE', F
 prewarm_sparse_kernels = getattr(kascade_module, 'prewarm_sparse_kernels', None)
 tpu_chunked_causal_attention = kascade_module.tpu_chunked_causal_attention
 
+# Import Tokamax sparse attention + block mask utility for layer-by-layer prefill
+_kascade_kernel_module = None
+splash_sparse_attention_fn = None
+create_block_mask_from_tile_indices_fn = None
+try:
+    _kk_spec = importlib.util.spec_from_file_location("kascade_block_sparse_kernel",
+        os.path.join(src_path, "MaxText/kernels/kascade_block_sparse_kernel.py"))
+    _kascade_kernel_module = importlib.util.module_from_spec(_kk_spec)
+    _kk_spec.loader.exec_module(_kascade_kernel_module)
+    splash_sparse_attention_fn = getattr(_kascade_kernel_module, 'splash_sparse_attention', None)
+    create_block_mask_from_tile_indices_fn = getattr(_kascade_kernel_module, 'create_block_mask_from_tile_indices', None)
+except Exception as e:
+    print(f"  [INFO] Could not import kascade_block_sparse_kernel: {e}", file=sys.stderr)
+
 # Decode kernel: sparse decode (loads only selected tiles from full KV cache)
 kascade_sparse_decode = getattr(kascade_module, 'kascade_sparse_decode', None)
 kascade_sparse_decode_pallas_v2 = getattr(kascade_module, 'kascade_sparse_decode_pallas_v2', None)
@@ -894,8 +908,11 @@ def _dense_layer_fn_impl(x, attn_norm_scale, wq, wk, wv, wo,
     """Single transformer layer: project + RoPE + dense attention + MLP.
     
     NOT JIT-compiled — safe to call with Tokamax SplashAttention at any S.
-    Returns (x, q, k_full, v_full) — q and k are needed by anchor layers
+    Returns (x, q, k_full, v_full) — q and k_full are needed by anchor layers
     to compute fresh tile scores for REUSE layers.
+    
+    IMPORTANT: Explicit `del` of dead intermediates before FFN to free HBM
+    in eager mode (Python holds locals until return).
     """
     B, S, E = x.shape
     normed = rms_norm_fn(x, attn_norm_scale)
@@ -905,6 +922,7 @@ def _dense_layer_fn_impl(x, attn_norm_scale, wq, wk, wv, wo,
     num_kv_heads = kv_dim // HEAD_DIM
     k = (normed @ wk).reshape(B, S, num_kv_heads, HEAD_DIM)
     v = (normed @ wv).reshape(B, S, num_kv_heads, HEAD_DIM)
+    del normed  # free [B, S, E] — 128 MB at S=32K
 
     q = jnp.transpose(q, (0, 2, 1, 3))
     k = jnp.transpose(k, (0, 2, 1, 3))
@@ -916,6 +934,7 @@ def _dense_layer_fn_impl(x, attn_norm_scale, wq, wk, wv, wo,
         repeats = NUM_HEADS // num_kv_heads
         k_full = jnp.repeat(k, repeats, axis=1)
         v_full = jnp.repeat(v, repeats, axis=1)
+        del k, v  # free 8-head KV — 64 MB at S=32K
     else:
         k_full = k
         v_full = v
@@ -924,11 +943,15 @@ def _dense_layer_fn_impl(x, attn_norm_scale, wq, wk, wv, wo,
     attn_out = jnp.transpose(attn_out, (0, 2, 1, 3)).reshape(B, S, NUM_HEADS * HEAD_DIM)
     attn_out = attn_out @ wo
     x = x + attn_out
+    del attn_out  # free [B, S, E] — 128 MB
 
+    # FFN — gate+up are ~1 GB at S=32K
     normed_ffn = rms_norm_fn(x, ffn_norm_scale)
     gate = jax.nn.silu(normed_ffn @ w_gate)
     up = normed_ffn @ w_up
+    del normed_ffn  # free [B, S, E] — 128 MB
     x = x + (gate * up) @ w_down
+    del gate, up  # free [B, S, MLP_DIM] × 2 — 1 GB at S=32K
 
     return x, q, k_full, v_full
 
@@ -1042,8 +1065,104 @@ def _per_qtile_sparse_attention(q, k, v, full_tile_indices, tile_size):
     return out_tiles.transpose(1, 2, 0, 3, 4).reshape(B, H, S, D)
 
 
-def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_full_map):
-    """Run prefill using per-query-tile sparse attention for REUSE layers.
+def _sparse_attention_dispatch(q, k, v, full_tile_indices, tile_size):
+    """Dispatch sparse attention to Tokamax SplashAttention on TPU.
+    
+    Always uses Tokamax on TPU — the unified kernel for all seq lengths.
+    The S×S mask required by Tokamax is constructed on CPU and transferred
+    to TPU for kernel compilation, then freed. At 128K the mask is 16 GB
+    but only lives temporarily during make_dynamic_splash_mha().
+    
+    Falls back to lax.scan gather only on CPU/GPU (no Tokamax).
+    
+    Args:
+        q, k, v: [B, H, S, D] — already RoPE'd
+        full_tile_indices: [B, H, Qg, top_k] per-query-tile K-tile selections
+        tile_size: tokens per tile
+    Returns:
+        output: [B, H, S, D]
+    """
+    B, H, S, D = q.shape
+    num_tiles = S // tile_size
+    platform = jax.devices()[0].platform
+    
+    # Tokamax SplashAttention — unified kernel for all S on TPU
+    if (platform == 'tpu' and TOKAMAX_SPLASH_AVAILABLE
+            and splash_sparse_attention_fn is not None
+            and create_block_mask_from_tile_indices_fn is not None):
+        # Convert per-Q-tile indices to block mask [B, H, Qg, num_tiles]
+        block_mask = create_block_mask_from_tile_indices_fn(
+            full_tile_indices, num_tiles, causal=True)
+        # Add diagonal: each Q tile always attends to its own K tile
+        diag_mask = jnp.eye(num_tiles, dtype=jnp.bool_)[None, None, :, :]
+        block_mask = block_mask | diag_mask
+        return splash_sparse_attention_fn(
+            q, k, v, block_mask, tile_size=tile_size,
+            num_heads=H, force_sparse=True)
+    
+    # CPU/GPU fallback — lax.scan gather (no Tokamax available)
+    return _per_qtile_sparse_attention(q, k, v, full_tile_indices, tile_size)
+
+
+def _sparse_layer_fn_tokamax(x, attn_norm_scale, wq, wk, wv, wo,
+                              ffn_norm_scale, w_gate, w_up, w_down,
+                              freq_cis, full_tile_idx):
+    """Single transformer layer with Tokamax sparse attention.
+    
+    NOT @jax.jit decorated — Tokamax SplashAttention leaks tracers inside JIT.
+    Called directly (not wrapped in jax.jit).
+    
+    IMPORTANT: In eager (non-JIT) mode, Python holds local references until
+    function return. We must explicitly `del` dead intermediates before FFN
+    to free ~320 MB of HBM (q, k_8head, v_8head, normed). Without this,
+    the FFN's gate+up (~1 GB at S=32K) pushes past HBM limits.
+    """
+    B, S, E = x.shape
+    normed = rms_norm_fn(x, attn_norm_scale)
+    
+    q = (normed @ wq).reshape(B, S, NUM_HEADS, HEAD_DIM)
+    kv_dim = wk.shape[1]
+    num_kv_heads = kv_dim // HEAD_DIM
+    k = (normed @ wk).reshape(B, S, num_kv_heads, HEAD_DIM)
+    v = (normed @ wv).reshape(B, S, num_kv_heads, HEAD_DIM)
+    del normed  # free [B, S, E] — 128 MB at S=32K
+    
+    q = jnp.transpose(q, (0, 2, 1, 3))
+    k = jnp.transpose(k, (0, 2, 1, 3))
+    v = jnp.transpose(v, (0, 2, 1, 3))
+    q, k = apply_rope(q, k, freq_cis)
+    
+    if num_kv_heads < NUM_HEADS:
+        repeats = NUM_HEADS // num_kv_heads
+        k_full = jnp.repeat(k, repeats, axis=1)
+        v_full = jnp.repeat(v, repeats, axis=1)
+        del k, v  # free 8-head KV — 64 MB at S=32K
+    else:
+        k_full = k
+        v_full = v
+    
+    attn_out = _sparse_attention_dispatch(q, k_full, v_full, full_tile_idx,
+                                          tile_size=TILE_SIZE)
+    del q  # free [B, 32, S, 64] — 128 MB at S=32K
+    attn_out = jnp.transpose(attn_out, (0, 2, 1, 3)).reshape(B, S, NUM_HEADS * HEAD_DIM)
+    attn_out = attn_out @ wo
+    x = x + attn_out
+    del attn_out  # free [B, S, E] — 128 MB
+    
+    # FFN — gate+up are ~1 GB at S=32K, so we need the HBM freed above
+    normed_ffn = rms_norm_fn(x, ffn_norm_scale)
+    gate = jax.nn.silu(normed_ffn @ w_gate)
+    up = normed_ffn @ w_up
+    del normed_ffn  # free [B, S, E] — 128 MB
+    x = x + (gate * up) @ w_down
+    del gate, up  # free [B, S, MLP_DIM] × 2 — 1 GB at S=32K
+    
+    return x, k_full, v_full
+
+
+def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_full_map,
+                                   decode_tile_size=None, decode_top_k=None):
+    """Run prefill using Tokamax sparse attention + build KV caches for decode.
 
     CRITICAL: ANCHOR layers compute FRESH tile scores on the test data,
     and REUSE layers use those fresh scores (not stale calibration indices).
@@ -1051,8 +1170,14 @@ def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_ful
     computes tile scores and caches them, and KascadeReuseAttention reads
     from the cache.
 
-    Both paths use JIT-compiled layer functions (compiled once, reused
-    across all 16 layers).
+    Unified Tokamax pipeline on TPU:
+      • Dense/Anchor layers → full_causal_splash_attention (Tokamax)
+      • REUSE layers → splash_sparse_attention (Tokamax, real block skipping)
+      • CPU/GPU fallback → lax.scan gather path
+
+    The S×S mask required by Tokamax is constructed on CPU, transferred
+    to TPU for kernel compilation, then freed. At 128K the mask is 16 GB
+    but only lives temporarily during make_dynamic_splash_mha().
 
     Complexity per REUSE layer: O(S × top_k × tile_size) instead of O(S²).
 
@@ -1061,18 +1186,40 @@ def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_ful
         input_ids: [B, S] int32
         schedule: layer schedule dict
         tile_indices_full_map: dict — calibration indices (used as FALLBACK only)
+        decode_tile_size: tile size for decode tile index computation
+        decode_top_k: top-k tiles for decode tile index computation
     Returns:
         kv_caches: dict[layer_id] -> (k, v) each [B, H, S, D]
         prefill_ppl: float
+        decode_tile_indices: dict[layer_id] -> [B, H, top_k] (for decode)
     """
     B, S = input_ids.shape
     freq_cis = precompute_freqs_cis(HEAD_DIM, S, theta=500000.0,
                                      rope_scaling=ROPE_SCALING)
     x = params['tok_embeddings']['embedding'][input_ids]  # [B, S, E]
 
+    # Select backend: Tokamax (non-JIT) on TPU, JIT paths on CPU/GPU
+    platform = jax.devices()[0].platform
+    use_tokamax = (platform == 'tpu' and TOKAMAX_SPLASH_AVAILABLE
+                   and splash_sparse_attention_fn is not None)
+    
+    mask_gb = S * S / 1e9  # S×S bool mask size in GB
+    if use_tokamax:
+        print(f"   Using Tokamax SplashAttention for all layers (S={S:,}, mask={mask_gb:.1f} GB)")
+    else:
+        print(f"   Using lax.scan sparse attention (Tokamax not available on {platform})")
+
+    # Tokamax: non-JIT (Tokamax leaks tracers inside @jax.jit)
+    # CPU/GPU: @jax.jit with chunked attention (no Tokamax)
+    if use_tokamax:
+        dense_layer_fn = _dense_layer_fn_impl  # non-JIT, Tokamax for dense attn
+    else:
+        dense_layer_fn = _dense_layer_fn  # JIT, uses _causal_attention
+
     kv_caches = {}
     # Fresh tile indices computed by ANCHOR layers on test data
     fresh_anchor_indices = {}  # anchor_layer_id -> [B, H, Qg, top_k]
+    decode_anchor_indices = {}  # anchor_layer_id -> [B, H, Qg, decode_top_k] (when decode params differ)
     hotbuf_layers = 0
     dense_layers = 0
     for i in range(NUM_LAYERS):
@@ -1091,7 +1238,7 @@ def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_ful
                 fresh_idx = tile_indices_full_map[i]  # fallback: calib
             else:
                 # No indices available — run dense
-                x, _q, k, v = _dense_layer_fn(
+                x, _q, k, v = dense_layer_fn(
                     x, lw['attention_norm']['scale'],
                     lw['DenseFullAttention_0']['Dense_0']['kernel'],
                     lw['DenseFullAttention_0']['Dense_1']['kernel'],
@@ -1103,6 +1250,7 @@ def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_ful
                     lw['down_proj']['kernel'],
                     freq_cis)
                 kv_caches[i] = (k[:, ::GQA_REPEATS], v[:, ::GQA_REPEATS])
+                del k, v, _q
                 dense_layers += 1
                 continue
 
@@ -1112,21 +1260,40 @@ def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_ful
                 perm_indices = jnp.array(perm_list, dtype=jnp.int32)
                 fresh_idx = fresh_idx[:, perm_indices]
 
-            x, k, v = _sparse_layer_fn(
-                x, lw['attention_norm']['scale'],
-                lw['DenseFullAttention_0']['Dense_0']['kernel'],
-                lw['DenseFullAttention_0']['Dense_1']['kernel'],
-                lw['DenseFullAttention_0']['Dense_2']['kernel'],
-                lw['DenseFullAttention_0']['Dense_3']['kernel'],
-                lw['ffn_norm']['scale'],
-                lw['gate_proj']['kernel'],
-                lw['up_proj']['kernel'],
-                lw['down_proj']['kernel'],
-                freq_cis, fresh_idx)
+            # Tokamax path: non-JIT, uses splash_sparse_attention internally
+            # JIT path: @jax.jit wrapper, uses lax.scan gather
+            if use_tokamax:
+                x, k_full, v_full = _sparse_layer_fn_tokamax(
+                    x, lw['attention_norm']['scale'],
+                    lw['DenseFullAttention_0']['Dense_0']['kernel'],
+                    lw['DenseFullAttention_0']['Dense_1']['kernel'],
+                    lw['DenseFullAttention_0']['Dense_2']['kernel'],
+                    lw['DenseFullAttention_0']['Dense_3']['kernel'],
+                    lw['ffn_norm']['scale'],
+                    lw['gate_proj']['kernel'],
+                    lw['up_proj']['kernel'],
+                    lw['down_proj']['kernel'],
+                    freq_cis, fresh_idx)
+            else:
+                x, k_full, v_full = _sparse_layer_fn(
+                    x, lw['attention_norm']['scale'],
+                    lw['DenseFullAttention_0']['Dense_0']['kernel'],
+                    lw['DenseFullAttention_0']['Dense_1']['kernel'],
+                    lw['DenseFullAttention_0']['Dense_2']['kernel'],
+                    lw['DenseFullAttention_0']['Dense_3']['kernel'],
+                    lw['ffn_norm']['scale'],
+                    lw['gate_proj']['kernel'],
+                    lw['up_proj']['kernel'],
+                    lw['down_proj']['kernel'],
+                    freq_cis, fresh_idx)
+            # Downsample KV to 8 heads, store on TPU
+            kv_caches[i] = (k_full[:, ::GQA_REPEATS], v_full[:, ::GQA_REPEATS])
+            del k_full, v_full, fresh_idx
             hotbuf_layers += 1
+            continue  # skip the shared kv_caches[i] assignment below
         else:
             # DENSE or ANCHOR: full attention + compute tile scores
-            x, q, k, v = _dense_layer_fn(
+            x, q, k, v = dense_layer_fn(
                 x, lw['attention_norm']['scale'],
                 lw['DenseFullAttention_0']['Dense_0']['kernel'],
                 lw['DenseFullAttention_0']['Dense_1']['kernel'],
@@ -1142,16 +1309,50 @@ def hotbuf_prefill_build_kv_caches(params, input_ids, schedule, tile_indices_ful
             if plan["type"] == "ANCHOR":
                 fresh_anchor_indices[i] = _compute_tile_scores(
                     q, k, TILE_SIZE, TOP_K_OPTIMIZED)
+                # Also compute at decode params if different (for decode tile indices)
+                if (decode_tile_size is not None and decode_top_k is not None
+                        and (decode_tile_size != TILE_SIZE or decode_top_k != TOP_K_OPTIMIZED)):
+                    decode_anchor_indices[i] = _compute_tile_scores(
+                        q, k, decode_tile_size, decode_top_k)
             del q  # free Q after scoring
             dense_layers += 1
 
         kv_caches[i] = (k[:, ::GQA_REPEATS], v[:, ::GQA_REPEATS])
+        del k, v
+
+    # Free JIT compilation cache to recover HBM
+    del dense_layer_fn
+    import gc; gc.collect()
 
     x = rms_norm_fn(x, params['norm']['scale'])
     print(f"   Prefill: {dense_layers} full-attn + {hotbuf_layers} hotbuf-attn layers")
 
     prefill_ppl = _compute_ppl_chunked(x, input_ids, params['output']['kernel'])
-    return kv_caches, prefill_ppl
+    del x  # free hidden states
+
+    # Build decode tile indices for REUSE layers from anchor's fresh indices
+    decode_tile_indices = {}
+    compute_tile_idx = (decode_tile_size is not None and decode_top_k is not None)
+    if compute_tile_idx:
+        # Use decode-specific indices if computed, else fall back to prefill indices
+        src_indices = decode_anchor_indices if decode_anchor_indices else fresh_anchor_indices
+        for layer_id, plan in schedule.items():
+            if plan["type"] == "REUSE":
+                anchor_id = plan["anchor_id"]
+                if anchor_id in src_indices:
+                    full_indices = src_indices[anchor_id]
+                    # full_indices: [B, H, Qg, top_k] — take last Q-tile for decode
+                    decode_idx = full_indices[:, :, -1, :]  # [B, H, top_k]
+                    # Apply head mapping
+                    head_map = plan.get("head_map", {})
+                    if head_map:
+                        perm_list = [head_map.get(h, h) for h in range(decode_idx.shape[1])]
+                        perm_indices = jnp.array(perm_list, dtype=jnp.int32)
+                        decode_idx = decode_idx[:, perm_indices]
+                    decode_tile_indices[layer_id] = decode_idx
+        del fresh_anchor_indices, decode_anchor_indices
+
+    return kv_caches, prefill_ppl, decode_tile_indices
 
 
 @jax.jit
@@ -1734,9 +1935,10 @@ def main():
                 jnp.zeros((1, pad_len), dtype=jnp.int32)], axis=1)
             print(f"   ⚠ Padded {pad_len} tokens (only had {decode_text_ids.shape[1]:,})")
         
-        kv_caches, prefill_ppl_decode, tile_indices_map = prefill_build_kv_caches(
+        kv_caches, prefill_ppl_decode, tile_indices_map = hotbuf_prefill_build_kv_caches(
             params, prefill_ids,
             schedule=schedule,
+            tile_indices_full_map=tile_indices_full_map if tile_indices_full_map else {},
             decode_tile_size=decode_ts,
             decode_top_k=decode_tk)
         
@@ -1978,6 +2180,10 @@ def main():
             worst_hotbuf_sparse = max(worst_hotbuf_sparse, layer_max_hs)
             worst_dense_sparse = max(worst_dense_sparse, layer_max_ds)
             
+            # Free cross-kernel validation temps for this layer
+            del k_test, v_test, k_tiled, v_tiled, k_sel, v_sel
+            del hot_k_xk, hot_v_xk
+
             status = '✅' if layer_max_hr < xk_threshold and layer_max_sr < xk_threshold else '❌'
             print(f"   Layer {layer_id:2d}: hotbuf↔ref {layer_max_hr:.6f}  "
                   f"sparse↔ref {layer_max_sr:.6f}  "
@@ -2006,6 +2212,10 @@ def main():
         # ================================================
         # DECODE LATENCY BENCHMARK
         # ================================================
+        # Free cross-kernel validation artifacts before timed runs
+        del hot_kv_map  # per-layer dict — data already in hot_k/v_stacked
+        import gc; gc.collect()
+
         print(f"\n  {'='*58}")
         print(f"  DECODE LATENCY  ({args.decode_steps} steps, B={DECODE_BATCH}, S={DECODE_SEQ_LEN:,})")
         print(f"  {'='*58}")
