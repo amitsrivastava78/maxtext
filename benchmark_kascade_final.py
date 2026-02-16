@@ -1312,6 +1312,11 @@ def main():
     auto_ts, auto_tk = auto_params(SEQ_LEN)
     TILE_SIZE = args.tile_size if args.tile_size is not None else auto_ts
     TOP_K_OPTIMIZED = args.top_k if args.top_k is not None else auto_tk
+    # TPU SplashAttention requires tile_size >= 128 (hardware block size)
+    if args.device == 'tpu' and TILE_SIZE < 128:
+        TILE_SIZE = 128
+        num_tiles_tmp = SEQ_LEN // TILE_SIZE
+        TOP_K_OPTIMIZED = max(2, num_tiles_tmp // 2)  # 50% at short seq
     # Auto-enable splash on TPU (Tokamax SplashAttention provides real block skipping)
     USE_SPLASH_KERNEL = args.use_splash_kernel or args.device == 'tpu'
     FORCE_SPARSE = args.force_sparse
@@ -1425,8 +1430,33 @@ def main():
         print(f"   Calibration: {calib_ids.shape[1]:,} tokens (start of dataset)")
         print(f"   Test:        {test_ids.shape[1]:,} tokens (end of dataset, ~{SEQ_LEN:,} tokens apart)")
     
-    # Calibrate
-    schedule = calibrate_on_real_text_optimized(params_dict, calib_ids, args.threshold, args.max_reuse_dist)
+    # When --decode with decode_seq_len > SEQ_LEN, calibrate at the longer
+    # sequence so that tile scores, head mappings, and schedule are computed
+    # from the correct number of tiles (e.g., 256 tiles at S=32K, not 4 at S=512).
+    # The globals must also match so KascadeAnchorAttention uses the right top_k.
+    if (args.decode or args.decode_only) and args.decode_seq_len and args.decode_seq_len > SEQ_LEN:
+        calib_seq_len = args.decode_seq_len
+        calib_data = decode_text_ids[:, :calib_seq_len]
+        calib_ts, calib_tk = auto_params(calib_seq_len)
+        if args.device == 'tpu' and calib_ts < 128:
+            calib_ts = 128
+            calib_tk = max(2, (calib_seq_len // 128) // 2)
+        if args.tile_size is not None:
+            calib_ts = args.tile_size
+        if args.top_k is not None:
+            calib_tk = args.top_k
+        print(f"\n  Calibrating at decode_seq_len={calib_seq_len:,} "
+              f"(tile_size={calib_ts}, top_k={calib_tk})")
+        # Override globals for calibration
+        saved_ts_calib, saved_tk_calib = TILE_SIZE, TOP_K_OPTIMIZED
+        TILE_SIZE, TOP_K_OPTIMIZED = calib_ts, calib_tk
+        schedule = calibrate_on_real_text_optimized(
+            params_dict, calib_data, args.threshold, args.max_reuse_dist)
+        # Restore globals (will be overridden again for PPL eval)
+        TILE_SIZE, TOP_K_OPTIMIZED = saved_ts_calib, saved_tk_calib
+    else:
+        schedule = calibrate_on_real_text_optimized(
+            params_dict, calib_ids, args.threshold, args.max_reuse_dist)
     reuse_count = sum(1 for v in schedule.values() if v["type"] == "REUSE")
     anchor_count = sum(1 for v in schedule.values() if v["type"] == "ANCHOR")
     dense_count = sum(1 for v in schedule.values() if v["type"] == "DENSE")
@@ -1486,13 +1516,42 @@ def main():
       import time
       params = params_dict['params']
 
+      # When --decode is specified, evaluate PPL at decode_seq_len (not tiny 512).
+      # At S=512 on TPU, tile_size=128 gives only 4 tiles = 50% density = no real sparsity.
+      # At S=8192+, tile_size=128 gives 64+ tiles with 12.5% density = meaningful sparse eval.
+      if (args.decode or args.decode_only) and args.decode_seq_len and args.decode_seq_len > SEQ_LEN:
+          ppl_seq_len = args.decode_seq_len
+          ppl_ids = decode_text_ids[:, :ppl_seq_len]
+          ppl_ts, ppl_tk = auto_params(ppl_seq_len)
+          if args.device == 'tpu' and ppl_ts < 128:
+              ppl_ts = 128
+              ppl_tk = max(2, (ppl_seq_len // 128) // 2)
+          # Respect explicit --top_k and --tile_size overrides for PPL sweep
+          if args.tile_size is not None:
+              ppl_ts = args.tile_size
+          if args.top_k is not None:
+              ppl_tk = args.top_k
+          ppl_num_tiles = ppl_seq_len // ppl_ts
+          print(f"\n  PPL/Prefill eval at decode_seq_len={ppl_seq_len:,} "
+                f"(tile_size={ppl_ts}, top_k={ppl_tk}/{ppl_num_tiles}={ppl_tk/ppl_num_tiles:.0%})")
+      else:
+          ppl_seq_len = SEQ_LEN
+          ppl_ids = test_ids
+          ppl_ts = TILE_SIZE
+          ppl_tk = TOP_K_OPTIMIZED
+          ppl_num_tiles = num_tiles
+
+      # Override globals so Flax model + hotbuf_prefill use ppl_ts/ppl_tk
+      saved_ts, saved_tk = TILE_SIZE, TOP_K_OPTIMIZED
+      TILE_SIZE, TOP_K_OPTIMIZED = ppl_ts, ppl_tk
+
       # --- Dense PPL (all layers = DENSE, no sparse) ---
       print("\n  Running DENSE PPL (Flax modules, all layers full attention)...")
       dense_schedule = {i: {"type": "DENSE"} for i in range(NUM_LAYERS)}
       model_dense = LlamaModel(schedule=dense_schedule, use_splash=False)
       KASCADE_CACHE.clear()
       ppl_dense = calculate_full_sequence_perplexity_chunked(
-          model_dense, params_dict, test_ids)
+          model_dense, params_dict, ppl_ids)
       print(f"   Dense PPL: {ppl_dense:.4f}")
 
       # --- Sparse PPL (Flax modules + Tokamax Pallas kernel) ---
@@ -1501,7 +1560,7 @@ def main():
                                 force_sparse=True)
       KASCADE_CACHE.clear()
       ppl_sparse = calculate_full_sequence_perplexity_chunked(
-          model_sparse, params_dict, test_ids)
+          model_sparse, params_dict, ppl_ids)
       print(f"   Sparse PPL: {ppl_sparse:.4f}")
 
       # Free Flax model intermediates before layer-by-layer timing
@@ -1527,46 +1586,70 @@ def main():
         print(f"\n  ❌ Gap is {diff_pct:.2f}%")
 
       # ==========================================================
-      # PREFILL SPEEDUP BENCHMARK (layer-by-layer timing)
+      # PREFILL SPEEDUP BENCHMARK (Flax model timing)
       # ==========================================================
-      # Uses the manual layer-by-layer path to measure wall-clock
-      # speedup of sparse vs dense prefill.  PPL from this path is
-      # reported for reference but the authoritative PPL is above.
+      # Times the same Flax model paths used for PPL eval above.
+      # Dense: DenseFullAttention (all layers)
+      # Sparse: KascadeAnchorAttention + KascadeReuseAttention
+      #         (REUSE layers use Tokamax SplashAttention on TPU)
+      #
+      # The PPL eval above already JIT-warmed both models, so these
+      # timed runs measure steady-state throughput.
       print("\n" + "=" * 70)
       print("  PREFILL SPEEDUP BENCHMARK")
-      print("  (layer-by-layer sparse vs dense prefill)")
+      print("  (Flax model: dense vs Tokamax sparse prefill)")
       print("=" * 70)
 
-      # Warmup run for JIT compilation (both paths)
-      # Free KV immediately — we'll rebuild for decode later
-      print("   Warming up JIT (dense)...")
-      kv_warm, _, _ = prefill_build_kv_caches(params, test_ids)
-      del kv_warm
-      print("   Warming up JIT (sparse)...")
-      kv_warm2, _ = hotbuf_prefill_build_kv_caches(
-          params, test_ids, schedule, tile_indices_full_map)
-      del kv_warm2
+      # Recreate models (they were deleted after PPL eval)
+      model_dense_t = LlamaModel(schedule=dense_schedule, use_splash=False)
+      model_sparse_t = LlamaModel(schedule=schedule, use_splash=USE_SPLASH_KERNEL,
+                                  force_sparse=True)
 
-      # Timed runs (JIT-warm)
-      # Free KV caches between each run to avoid OOM
+      # JIT warmup (hidden states only — no lm_head projection)
+      print("   Warming up JIT (dense)...", flush=True)
+      t_jit0 = time.perf_counter()
+      KASCADE_CACHE.clear()
+      _h = model_dense_t.apply(params_dict, ppl_ids, method=model_dense_t.forward_hidden)
+      jax.block_until_ready(_h); del _h
+      print(f"   Dense JIT warmup: {time.perf_counter()-t_jit0:.0f}s", flush=True)
+
+      print("   Warming up JIT (sparse)...", flush=True)
+      t_jit1 = time.perf_counter()
+      KASCADE_CACHE.clear()
+      _h = model_sparse_t.apply(params_dict, ppl_ids, method=model_sparse_t.forward_hidden)
+      jax.block_until_ready(_h); del _h
+      print(f"   Sparse JIT warmup: {time.perf_counter()-t_jit1:.0f}s", flush=True)
+
+      # Timed runs
       dense_times_ms = []
       sparse_times_ms = []
-      n_runs = 3
+      n_runs = 2
       for run_i in range(n_runs):
           # Dense
+          print(f"   Run {run_i+1}/{n_runs}: dense...", end="", flush=True)
+          KASCADE_CACHE.clear()
           t0 = time.perf_counter()
-          kv_tmp, _, _ = prefill_build_kv_caches(params, test_ids)
-          jax.block_until_ready(kv_tmp)
-          dense_times_ms.append((time.perf_counter() - t0) * 1000)
-          del kv_tmp
+          _h = model_dense_t.apply(params_dict, ppl_ids, method=model_dense_t.forward_hidden)
+          jax.block_until_ready(_h)
+          d_ms = (time.perf_counter() - t0) * 1000
+          dense_times_ms.append(d_ms)
+          print(f" {d_ms:.0f}ms", end="", flush=True)
+          del _h
 
           # Sparse
+          print(f"  sparse...", end="", flush=True)
+          KASCADE_CACHE.clear()
           t0 = time.perf_counter()
-          kv_tmp2, _ = hotbuf_prefill_build_kv_caches(
-              params, test_ids, schedule, tile_indices_full_map)
-          jax.block_until_ready(kv_tmp2)
-          sparse_times_ms.append((time.perf_counter() - t0) * 1000)
-          del kv_tmp2
+          _h = model_sparse_t.apply(params_dict, ppl_ids, method=model_sparse_t.forward_hidden)
+          jax.block_until_ready(_h)
+          s_ms = (time.perf_counter() - t0) * 1000
+          sparse_times_ms.append(s_ms)
+          print(f" {s_ms:.0f}ms", flush=True)
+          del _h
+
+      del model_dense_t, model_sparse_t
+      KASCADE_CACHE.clear()
+      import gc; gc.collect()
 
       dense_avg = sum(dense_times_ms) / n_runs
       sparse_avg = sum(sparse_times_ms) / n_runs
@@ -1574,8 +1657,8 @@ def main():
       prefill_speedup_measured = speedup
       prefill_attn_pct = (1 - sparse_avg / dense_avg) * 100 if dense_avg > 0 else 0
 
-      sparse_ratio = TOP_K_OPTIMIZED / num_tiles
-      sparse_tokens = TOP_K_OPTIMIZED * TILE_SIZE
+      ppl_sparse_ratio = ppl_tk / ppl_num_tiles if ppl_num_tiles > 0 else 0
+      ppl_sparse_tokens = ppl_tk * ppl_ts
 
       runs_d = ", ".join(f"{t:.0f}" for t in dense_times_ms)
       runs_s = ", ".join(f"{t:.0f}" for t in sparse_times_ms)
@@ -1585,17 +1668,21 @@ def main():
       print(f"   PPL degradation: {diff_pct:.2f}%")
 
       print(f"\n  Analysis:")
-      print(f"   Tiles: {num_tiles}, Top-K: {TOP_K_OPTIMIZED} ({sparse_ratio:.0%})")
+      print(f"   Eval seq_len:  {ppl_seq_len:,}")
+      print(f"   Tiles: {ppl_num_tiles}, Top-K: {ppl_tk} ({ppl_sparse_ratio:.0%})")
       print(f"   Schedule: {dense_count}D + {anchor_count}A + {reuse_count}R")
-      print(f"   REUSE layers: Q[{SEQ_LEN:,}] × hot_KV[{sparse_tokens}] "
-            f"(vs Q[{SEQ_LEN:,}] × K[{SEQ_LEN:,}])")
+      print(f"   REUSE layers: Q[{ppl_seq_len:,}] × hot_KV[{ppl_sparse_tokens}] "
+            f"(vs Q[{ppl_seq_len:,}] × K[{ppl_seq_len:,}])")
       print(f"   Attention FLOPs saved per REUSE layer: "
-            f"{(1 - sparse_tokens/SEQ_LEN)*100:.0f}%")
+            f"{(1 - ppl_sparse_tokens/ppl_seq_len)*100:.0f}%")
 
-      if SEQ_LEN >= 65536:
-          full_attn_gb = SEQ_LEN * SEQ_LEN * 2 * NUM_HEADS / 1e9  # bf16
-          hot_attn_gb = SEQ_LEN * sparse_tokens * 2 * NUM_HEADS / 1e9
-          print(f"\n   At seq_len={SEQ_LEN:,}:")
+      # Restore globals for decode section (which uses SEQ_LEN-based params)
+      TILE_SIZE, TOP_K_OPTIMIZED = saved_ts, saved_tk
+
+      if ppl_seq_len >= 65536:
+          full_attn_gb = ppl_seq_len * ppl_seq_len * 2 * NUM_HEADS / 1e9  # bf16
+          hot_attn_gb = ppl_seq_len * ppl_sparse_tokens * 2 * NUM_HEADS / 1e9
+          print(f"\n   At seq_len={ppl_seq_len:,}:")
           print(f"     Full attention matrix: {full_attn_gb:.1f} GB per layer (OOM!)")
           print(f"     Hot buffer matrix:     {hot_attn_gb:.2f} GB per layer (fits)")
 
