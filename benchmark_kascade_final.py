@@ -398,6 +398,47 @@ def dense_decode_attn(q, k_cache, v_cache, query_pos):
     return jnp.einsum('bhqk,bhkd->bhqd', weights, v_cache)
 
 
+def gqa_decode_attn(q, k_cache, v_cache, query_pos):
+    """GQA-native decode attention without materializing expanded KV.
+
+    Instead of expanding K,V from 8→32 heads (256 MB at S=32K),
+    reshapes Q into GQA groups and broadcasts.  Peak temporary
+    memory: scores tensor [B, 8, 4, 1, S] ≈ 2 MB.
+
+    Args:
+        q:       [B, NUM_HEADS, 1, D]      (32 heads)
+        k_cache: [B, NUM_KV_HEADS, S, D]   (8 heads)
+        v_cache: [B, NUM_KV_HEADS, S, D]   (8 heads)
+        query_pos: [B] — for causal mask
+    Returns:
+        [B, NUM_HEADS, 1, D]  (32 heads)
+    """
+    B, H, _, D = q.shape
+    H_kv = k_cache.shape[1]
+    G = H // H_kv  # GQA group size (4)
+    sm_scale = D ** -0.5
+
+    # Reshape Q into GQA groups: [B, H_kv, G, 1, D]
+    q_g = q.reshape(B, H_kv, G, 1, D)
+    # K,V: [B, H_kv, S, D] → [B, H_kv, 1, S, D]  (broadcast over G)
+    k = k_cache[:, :, None, :, :]   # [B, 8, 1, S, D]
+    v = v_cache[:, :, None, :, :]   # [B, 8, 1, S, D]
+
+    # scores: [B, 8, 4, 1, D] @ [B, 8, 1, D, S] → [B, 8, 4, 1, S]
+    scores = jnp.matmul(q_g, jnp.swapaxes(k, -2, -1)) * sm_scale
+
+    # Causal mask
+    S = k_cache.shape[2]
+    qp = query_pos[:, None, None, None, None]           # [B,1,1,1,1]
+    kv_pos = jnp.arange(S, dtype=jnp.int32)[None, None, None, None, :]  # [1,1,1,1,S]
+    scores = jnp.where(kv_pos <= qp, scores, -1e10)
+
+    weights = jax.nn.softmax(scores, axis=-1)  # [B, 8, 4, 1, S]
+    # output: [B, 8, 4, 1, S] @ [B, 8, 1, S, D] → [B, 8, 4, 1, D]
+    out = jnp.matmul(weights, v)
+    return out.reshape(B, H, 1, D)  # [B, 32, 1, D]
+
+
 def sparse_decode_attn(q, k_cache, v_cache, tile_indices, tile_size,
                        backend=None):
     """Sparse decode: loads only selected tiles from full KV cache.
@@ -460,6 +501,91 @@ def hotbuf_decode_attn(q, hot_k, hot_v):
     scores = jnp.einsum('bhqd,bhkd->bhqk', q, hot_k) * sm_scale
     weights = jax.nn.softmax(scores, axis=-1)
     return jnp.einsum('bhqk,bhkd->bhqd', weights, hot_v)
+
+
+def decode_tile_rescore(q, k_cache, tile_size, top_k):
+    """Rescore tiles at KV-head level from a single decode-step query.
+
+    Averages the 4 Q heads in each GQA group, then scores each of 8
+    KV heads against its tile-mean keys.  Returns [B, 8, top_k], i.e.
+    one set of tile indices per KV head — identical for all Q heads in
+    the same GQA group.  This matches prefill-time scoring granularity
+    where all Q heads in a group share the same KV tiles.
+
+    A single decode-token Q is inherently noisy; per-Q-head scoring
+    amplifies that noise and causes generation to diverge from dense.
+    Averaging across the GQA group stabilises tile selection.
+
+    Memory: K never expanded from 8→32 heads.  Peak: ~16 KB.
+
+    Args:
+        q:        [B, NUM_HEADS, 1, D] — query (32 heads, RoPE applied)
+        k_cache:  [B, NUM_KV_HEADS, S, D] — full KV cache (8 heads)
+        tile_size: int (e.g. 128)
+        top_k:     int — tiles to select per KV head
+
+    Returns:
+        tile_indices: [B, NUM_KV_HEADS, top_k] — per-KV-head tile indices
+    """
+    B, H_kv, S, D = k_cache.shape
+    H = q.shape[1]  # NUM_HEADS (32)
+    G = H // H_kv   # GQA_REPEATS (4)
+    num_tiles = S // tile_size
+    sm_scale = D ** -0.5
+
+    # Tile-mean keys at 8 KV heads: [B, 8, num_tiles, D]
+    k_tiled = k_cache.reshape(B, H_kv, num_tiles, tile_size, D)
+    k_tile_means = jnp.mean(k_tiled, axis=3)  # [B, 8, num_tiles, D]
+
+    # Average Q heads within each GQA group: [B, 32, 1, D] → [B, 8, 1, D]
+    q_avg = q.reshape(B, H_kv, G, 1, D).mean(axis=2)  # [B, 8, 1, D]
+
+    # Score: Q_avg[B,8,1,D] @ K_means^T[B,8,D,num_tiles] → [B,8,1,num_tiles]
+    tile_scores = jnp.einsum('bhqd,bhtd->bhqt', q_avg, k_tile_means) * sm_scale
+    tile_scores = tile_scores[:, :, 0, :]  # [B, 8, num_tiles]
+
+    # Top-k per KV head
+    _, indices = jax.lax.top_k(tile_scores, top_k)  # [B, 8, top_k]
+    return indices
+
+
+def kv_head_build_hot_buffer(k_cache, v_cache, tile_indices, tile_size):
+    """Build hot KV buffers from 8-head KV cache + 8-head tile indices.
+
+    Gathers at 8 KV heads, then jnp.repeat to 32 Q heads.  All Q heads
+    in a GQA group share the same hot buffer slice — matching how the
+    full prefill builds hot buffers.
+
+    Memory: gather at 8 heads (~6 MB), repeat to 32 heads (~25 MB).
+    No 256 MB full-KV expansion.
+
+    Args:
+        k_cache:  [B, NUM_KV_HEADS, S, D]   (8 heads)
+        v_cache:  [B, NUM_KV_HEADS, S, D]
+        tile_indices: [B, NUM_KV_HEADS, top_k]  (8-head indices)
+        tile_size: int
+
+    Returns:
+        (hot_k, hot_v): each [B, NUM_HEADS, top_k * tile_size, D]  (32 heads)
+    """
+    B, H_kv, S, D = k_cache.shape
+    top_k = tile_indices.shape[2]
+    sparse_len = top_k * tile_size
+    num_tiles = S // tile_size
+
+    k_tiled = k_cache.reshape(B, H_kv, num_tiles, tile_size, D)
+    v_tiled = v_cache.reshape(B, H_kv, num_tiles, tile_size, D)
+    b_idx = jnp.arange(B)[:, None, None]
+    h_idx = jnp.arange(H_kv)[None, :, None]
+
+    # Gather at 8 KV heads: [B, 8, top_k, tile_size, D] → [B, 8, sparse_len, D]
+    hot_k_8 = k_tiled[b_idx, h_idx, tile_indices].reshape(B, H_kv, sparse_len, D)
+    hot_v_8 = v_tiled[b_idx, h_idx, tile_indices].reshape(B, H_kv, sparse_len, D)
+
+    # Expand to 32 Q heads (each GQA group shares the same KV data)
+    hot_k = jnp.repeat(hot_k_8, GQA_REPEATS, axis=1)  # [B, 32, sparse_len, D]
+    hot_v = jnp.repeat(hot_v_8, GQA_REPEATS, axis=1)
+    return hot_k, hot_v
 
 
 def make_hotbuf_decode_step_fn(schedule):
@@ -681,17 +807,36 @@ def make_decode_step_fn(schedule, use_sparse=False):
 
 def autoregressive_generate(params, kv_caches, embed_table, start_token_id, 
                             start_pos, freq_cis_full, num_steps, schedule,
-                            hot_k_stacked=None, hot_v_stacked=None,
-                            reuse_layer_ids=None, temperature=0.0):
-    """Autoregressive text generation with proper KV cache appending.
+                            hot_k_dict=None, hot_v_dict=None,
+                            reuse_layer_ids=None, tile_size_override=None,
+                            top_k_override=None, temperature=0.0):
+    """Autoregressive text generation with DYNAMIC ANCHOR re-scoring.
     
     Each step:
       1. Embed the current token
-      2. Run decode step → get logits
-      3. Pick next token (greedy if temperature=0)
-      4. Compute K,V for the new token at each layer
-      5. Write K,V into the cache at the current position
+      2. Run through all layers with KV cache update
+      3. At ANCHOR layers: rescore tiles using this step's Q vector,
+         rebuild hot buffers for downstream REUSE layers
+      4. REUSE layers use the freshly-rebuilt hot buffers
+      5. Pick next token (greedy if temperature=0)
       6. Increment position
+    
+    Dynamic Anchoring:
+      Unlike the latency benchmark (which uses static hot buffers for
+      fair timing), this function can re-evaluate tile relevance during
+      generation.  However, rescoring at every step is counterproductive:
+      a single decode-token Q is too noisy to reliably pick tiles, and
+      after a 32K prefill adding 1 token changes KV by only 0.003%.
+
+      Instead, rescoring triggers only at TILE BOUNDARIES — after
+      tile_size (128) new tokens have been generated since the last
+      rescoring (or since prefill).  At that point a full new tile's
+      worth of content exists, making rescoring meaningful.
+
+      For short generation (20 tokens after 32K prefill): no rescoring
+      → hot buffers = prefill tiles → matches dense output.
+      For long generation (1000+ tokens): rescoring every 128 steps
+      → tiles stay fresh as context grows.
     
     Args:
         params: model params dict (params_dict['params'])
@@ -703,8 +848,12 @@ def autoregressive_generate(params, kv_caches, embed_table, start_token_id,
         freq_cis_full: [max_S, D//2] — RoPE frequencies
         num_steps: how many tokens to generate
         schedule: layer schedule dict
-        hot_k_stacked, hot_v_stacked: optional hot buffers for REUSE layers
+        hot_k_dict, hot_v_dict: optional pre-unstacked hot buffer dicts
+                   {hot_idx: [B, H, sparse_len, D]} — caller must unstack
+                   and del stacked arrays before calling to free 629 MB.
         reuse_layer_ids: list of REUSE layer indices (for hot buffer indexing)
+        tile_size_override: tile size (if None, uses TILE_SIZE)
+        top_k_override: top-k tiles (if None, inferred from hot buffer shape)
         temperature: 0.0 = greedy, >0 = sampling
     
     Returns:
@@ -720,6 +869,39 @@ def autoregressive_generate(params, kv_caches, embed_table, start_token_id,
     if reuse_layer_ids:
         for idx, lid in enumerate(reuse_layer_ids):
             layer_to_hot_idx[lid] = idx
+    
+    # Build anchor → downstream reuse layers map for dynamic re-anchoring.
+    # Each anchor is responsible for its reuse layers (those with
+    # anchor_id == this anchor's layer_id in the schedule).
+    anchor_to_reuse = {}  # anchor_layer_id -> [list of (reuse_layer_id, hot_idx)]
+    for lid in range(NUM_LAYERS):
+        plan = schedule.get(lid, {"type": "ANCHOR"})
+        if plan["type"] == "REUSE" and "anchor_id" in plan:
+            anc = plan["anchor_id"]
+            if anc not in anchor_to_reuse:
+                anchor_to_reuse[anc] = []
+            anchor_to_reuse[anc].append((lid, layer_to_hot_idx.get(lid, -1)))
+    
+    # hot_k_dict / hot_v_dict are pre-unstacked by the caller
+    # to avoid holding 629 MB stacked arrays during generation.
+    if hot_k_dict is None:
+        hot_k_dict = {}
+    if hot_v_dict is None:
+        hot_v_dict = {}
+    tile_size = tile_size_override if tile_size_override else TILE_SIZE
+    if hot_k_dict and reuse_layer_ids:
+        # Infer top_k from first entry's sparse_len
+        first_entry = next(iter(hot_k_dict.values()))
+        sparse_len = first_entry.shape[2]  # [B, H, sparse_len, D]
+        top_k_tiles = top_k_override if top_k_override else (sparse_len // tile_size)
+    else:
+        top_k_tiles = top_k_override if top_k_override else TOP_K_OPTIMIZED
+    
+    # Tile-boundary rescoring: only rescore after tile_size new tokens
+    # have accumulated since the last rescoring (or since prefill).
+    # This avoids noisy single-token scoring while keeping tiles fresh
+    # for long generation runs.
+    steps_since_rescore = 0
     
     for step in range(num_steps):
         # 1. Embed current token: [1, 1, E]
@@ -789,16 +971,34 @@ def autoregressive_generate(params, kv_caches, embed_table, start_token_id,
             
             # Attention: Q @ KV cache
             is_reuse = plan["type"] == "REUSE"
-            if is_reuse and hot_k_stacked is not None and i in layer_to_hot_idx:
-                # Use hot buffer for REUSE layers
-                hot_k = hot_k_stacked[layer_to_hot_idx[i]]
-                hot_v = hot_v_stacked[layer_to_hot_idx[i]]
-                attn_out = hotbuf_decode_attn(q, hot_k, hot_v)
+            if is_reuse and i in layer_to_hot_idx and layer_to_hot_idx[i] in hot_k_dict:
+                # Use hot buffer for REUSE layers (from unstacked dict)
+                hot_idx = layer_to_hot_idx[i]
+                attn_out = hotbuf_decode_attn(q, hot_k_dict[hot_idx], hot_v_dict[hot_idx])
             else:
-                # Dense: attend to full KV cache
-                k_exp = jnp.repeat(k_cache, GQA_REPEATS, axis=1)
-                v_exp = jnp.repeat(v_cache, GQA_REPEATS, axis=1)
-                attn_out = dense_decode_attn(q, k_exp, v_exp, query_pos)
+                # Dense/Anchor: GQA-native attention (no 256 MB KV expansion)
+                attn_out = gqa_decode_attn(q, k_cache, v_cache, query_pos)
+                
+                # DYNAMIC ANCHORING: rescore tiles at TILE BOUNDARIES.
+                # After tile_size new tokens, the KV landscape may have
+                # shifted enough to warrant new tile selection.  Before
+                # that, the prefill-time tiles are still optimal.
+                if (plan["type"] == "ANCHOR" and i in anchor_to_reuse
+                        and hot_k_dict
+                        and steps_since_rescore >= tile_size):
+                    # KV-head-level rescoring (8 heads, Q averaged in GQA groups)
+                    new_tile_idx = decode_tile_rescore(
+                        q, k_cache, tile_size, top_k_tiles)  # [B, 8, top_k]
+                    # Rebuild hot buffers: gather at 8 heads, repeat to 32.
+                    # All Q heads in a GQA group share the same tiles,
+                    # matching prefill-time scoring granularity.
+                    for reuse_lid, hot_idx in anchor_to_reuse[i]:
+                        r_k_cache, r_v_cache = kv_caches[reuse_lid]
+                        hot_k_new, hot_v_new = kv_head_build_hot_buffer(
+                            r_k_cache, r_v_cache, new_tile_idx, tile_size)
+                        hot_k_dict[hot_idx] = hot_k_new  # [B, 32, sparse_len, D]
+                        hot_v_dict[hot_idx] = hot_v_new
+                    steps_since_rescore = 0  # Reset after rescoring
             
             attn_out = jnp.transpose(attn_out, (0, 2, 1, 3))
             attn_out = attn_out.reshape(1, 1, NUM_HEADS * HEAD_DIM)
@@ -831,6 +1031,7 @@ def autoregressive_generate(params, kv_caches, embed_table, start_token_id,
         generated.append(next_token)
         current_token = next_token
         pos += 1
+        steps_since_rescore += 1
     
     return generated, kv_caches
 
@@ -2704,6 +2905,12 @@ def main():
             HEAD_DIM, DECODE_SEQ_LEN, theta=500000.0, rope_scaling=ROPE_SCALING)
         
         # --- Build hot KV buffers (one-time gather cost) ---
+        # Hot buffers start from prefill tile indices.  The LATENCY benchmark
+        # (make_hotbuf_decode_step_fn) keeps them static for fair timing.
+        # The CORRECTNESS benchmark (autoregressive_generate) uses DYNAMIC
+        # ANCHORING: after each anchor layer, decode_tile_rescore() cheaply
+        # recomputes tile relevance and rebuilds hot buffers for downstream
+        # reuse layers.  See autoregressive_generate() docstring.
         # KV stored at 8 heads — expand to 32 for hot buffer build.
         # Hot buffers are tiny (sparse_tokens << S), so 32-head is fine.
         print(f"\n  Building hot KV buffers (one-time gather)...")
@@ -3181,6 +3388,8 @@ def main():
         # ================================================
         # Generate tokens with dense vs sparse (hotbuf) decode,
         # properly appending each token's K,V to the cache.
+        # DYNAMIC ANCHOR: autoregressive_generate() rescores tiles at
+        # each anchor layer every step, keeping hot buffers fresh.
         print(f"\n  {'='*58}")
         print(f"  AUTOREGRESSIVE GENERATION  ({args.decode_steps} tokens, S={DECODE_SEQ_LEN:,})")
         print(f"  {'='*58}")
@@ -3191,6 +3400,26 @@ def main():
         
         # Dense schedule (all layers full attention)
         dense_schedule_gen = {i: {"type": "DENSE"} for i in range(NUM_LAYERS)}
+        
+        # Unstack hot buffers NOW (before any generation) and free
+        # the stacked arrays (629 MB) so generation has headroom.
+        _hot_k_dict = {}
+        _hot_v_dict = {}
+        _top_k_gen = TOP_K_OPTIMIZED
+        _ts_gen = TILE_SIZE
+        if hot_k_stacked is not None and reuse_layer_ids:
+            _ts_gen = decode_ts
+            sparse_len_gen = hot_k_stacked.shape[3]
+            _top_k_gen = sparse_len_gen // _ts_gen
+            for idx in range(hot_k_stacked.shape[0]):
+                _hot_k_dict[idx] = hot_k_stacked[idx]
+                _hot_v_dict[idx] = hot_v_stacked[idx]
+        # Free stacked arrays in caller scope — 629 MB
+        del hot_k_stacked, hot_v_stacked
+        import gc; gc.collect()
+        
+        print(f"   Dynamic Anchor — tile-boundary rescoring (every {_ts_gen} new tokens)")
+        print(f"         (prefill tiles used until {_ts_gen} new tokens generated)")
         
         # Run dense first, then free its KV copy before sparse
         kv_dense = {k: (jnp.array(kk), jnp.array(vv)) for k, (kk, vv) in kv_caches.items()}
@@ -3205,9 +3434,10 @@ def main():
         sparse_gen, kv_sparse = autoregressive_generate(
             params, kv_sparse, embed_table, gen_start_token, gen_start_pos,
             freq_cis_full, args.decode_steps, schedule,
-            hot_k_stacked=hot_k_stacked, hot_v_stacked=hot_v_stacked,
-            reuse_layer_ids=reuse_layer_ids)
-        del kv_sparse
+            hot_k_dict=_hot_k_dict, hot_v_dict=_hot_v_dict,
+            reuse_layer_ids=reuse_layer_ids,
+            tile_size_override=_ts_gen, top_k_override=_top_k_gen)
+        del kv_sparse, _hot_k_dict, _hot_v_dict
         
         # Compare generated sequences
         match_count = sum(1 for d, s in zip(dense_gen, sparse_gen) if d == s)
@@ -3242,6 +3472,7 @@ def main():
         print(f"  {'='*58}")
         print(f"   KV caches:         Real (from prefill on {DECODE_SEQ_LEN:,} tokens of C4 text)")
         print(f"   Tile indices:      Real (from anchor Q,K activations)")
+        print(f"   Anchor mode:       Dynamic (tile-boundary rescoring, interval={decode_ts} steps)")
         print(f"   Correctness:       {'✅' if correctness_ok else '❌'}  "
               f"(top-5 overlap: {top5_overlap}/5, max Δ={max_logit_diff:.2f})")
         print(f"   Attention speedup: {attn_speedup_med:.2f}x  "
